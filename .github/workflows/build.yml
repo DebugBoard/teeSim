@@ -28,8 +28,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build golang-go clang libclang-dev zip
 
+      # The action installs "tools platform-tools" by default, but the legacy "tools" package has
+      # been removed from the SDK repository and sdkmanager now fails on it. Ask only for
+      # platform-tools; everything else the build needs is installed explicitly below.
       - name: Set up the Android SDK and NDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Install NDK, CMake and build-tools
         run: sdkmanager --install "ndk;${NDK_VERSION}" "cmake;3.22.1" "build-tools;36.0.0" "platforms;android-36"
 
