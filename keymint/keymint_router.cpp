@@ -872,8 +872,14 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       if (real_) {
         ForwardGuard g;
         auto st = real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
+        std::string out_tag = "-";
+        size_t out_len = 0;
+        if (st.isOk() && out) {
+          out_tag = BlobTag(*out);
+          out_len = out->size();
+        }
         LOGI("upgradeKey: real HAL returned blob=%s, blob_len=%zu, ok=%d",
-             out ? BlobTag(*out).c_str() : "-", out ? out->size() : 0, st.isOk());
+             out_tag.c_str(), out_len, st.isOk());
         return st;
       }
       return Status(-100);

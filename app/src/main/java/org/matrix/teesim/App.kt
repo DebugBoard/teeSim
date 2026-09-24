@@ -446,10 +446,11 @@ object App {
                 val lastBootMs = e.optLong("lastBootMs", 0L)
                 val hint = e.optString("pkg", "")
 
-                // No resolvable package: leave the cursor untouched so the count is not lost.
-                // Remember it under the app token, not the bare package: a work profile's copy of an
-                // app is a different caller and deserves its own count, and the token is also what
-                // the Scope picker and config.json spell it as.
+                // Prefer a live PackageManager package name, but fall back to the lib's package hint.
+                // If neither is available, leave the cursor untouched so the count can be retried
+                // later. Remember it under the app token, not the bare package: a work profile's
+                // copy of an app is a different caller and deserves its own count, and the token is
+                // also what the Scope picker and config.json spell it as.
                 val pkg =
                     Packages.packagesForUid(uid).firstOrNull()?.takeIf { it.isNotEmpty() }
                         ?: hint.takeIf { it.isNotEmpty() }
