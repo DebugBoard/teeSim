@@ -446,13 +446,14 @@ object App {
                 val lastBootMs = e.optLong("lastBootMs", 0L)
                 val hint = e.optString("pkg", "")
 
+                // No resolvable package: leave the cursor untouched so the count is not lost.
+                // Remember it under the app token, not the bare package: a work profile's copy of an
+                // app is a different caller and deserves its own count, and the token is also what
+                // the Scope picker and config.json spell it as.
                 val pkg =
                     Packages.packagesForUid(uid).firstOrNull()?.takeIf { it.isNotEmpty() }
                         ?: hint.takeIf { it.isNotEmpty() }
-                        ?: continue // no resolvable package: leave the cursor untouched so the
-                // count isn't lost Remembered under the app token, not the bare package: a work
-                // profile's copy of an app is a different caller and deserves its own count, and
-                // the token is also what the Scope picker and config.json spell it as.
+                        ?: continue
                 val token = Scope.entryToken(pkg, Packages.userIdOf(uid))
                 // lastBootMs is on CLOCK_BOOTTIME; the same offset (wallNow - bootNowMs) maps it to
                 // wall time.

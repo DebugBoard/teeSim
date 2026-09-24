@@ -53,13 +53,6 @@ import org.json.JSONObject
  * place auto-included uids are visible, since the rule needs the root-only known_packages.json
  * baseline. Empty profiles[] with epoch 0 before the first push) POST /rescan -> { ok, uids }
  * (re-resolve against the live device and re-push; how a newly installed app is discovered, there
- * being no package watcher) GET /packages -> { ok, firstAppUid, apps:[ {uid, packages:[..], label,
- * system, launchable, enabled, installTime, freq, lastUsed, recent} ] } (every installed app, one
- * entry per uid, for the Scope picker: installTime = epoch ms of first install; freq = persistent
- * key-request count; lastUsed = epoch ms of last request; recent = requested a key since this boot)
- * GET /icon?pkg=P&token=T -> raw image/png (query-token auth, like /logs/download; 404 when the
- * package has no icon) POST /usage/clear -> { ok, cleared } (wipes the frequency memory) POST
- * /keys/db/delete?ids=1,2,3 -> { ok, deleted, requested } (removes those keyentry ids from
  * being no package watcher) POST /rkp?name=P&on=true|false -> { ok, name, value } (set one RKP knob
  * live and persist it, atomically; name must be a known knob) GET /packages -> { ok, firstAppUid,
  * apps:[ {uid, packages:[..], label, system, launchable, enabled, installTime, freq, lastUsed,

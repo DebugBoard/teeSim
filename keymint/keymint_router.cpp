@@ -83,6 +83,9 @@ std::vector<Profile> g_profiles;
 // Signalled by teesim_cfg_commit. Operations on one of our own key blobs wait on this rather than
 // failing while the daemon has not pushed a config yet; see WaitForDefaultTa.
 std::condition_variable g_cfg_cv;
+// Guarded by g_cfg_mu. Latched once WaitForDefaultTa times out so repeated boot-time callers fail
+// fast until the daemon commits a fresh config generation.
+bool g_cfg_wait_gave_up = false;
 bool g_strongbox_ok = false;  // device can patch real StrongBox keys; else StrongBox forces generation
 // The device-wide MODULE_HASH to seed a freshly built TA with, so a generation-mode key carries the
 // tag keystore2 only sends once per boot (and never resends to a TA built afterwards). Preference:
@@ -215,16 +218,15 @@ TaPtr WaitForDefaultTa(SecurityLevel level) {
   // Latched once the wait has run out, so a daemon that never pushes (no keybox, say) costs one
   // stall rather than one per call: every app touching a key of ours would otherwise park a
   // keystore2 binder thread for the full timeout and could starve the pool at boot.
-  static bool gave_up = false;
   std::unique_lock<std::mutex> lk(g_cfg_mu);
   if (g_profiles.empty()) {
-    if (gave_up) return {};
+    if (g_cfg_wait_gave_up) return {};
     LOGW("no profile configured yet; holding an operation on one of our keys for up to %llds "
          "rather than failing it",
          static_cast<long long>(kConfigWait.count()));
     g_cfg_cv.wait_for(lk, kConfigWait, [] { return !g_profiles.empty(); });
     if (g_profiles.empty()) {
-      gave_up = true;
+      g_cfg_wait_gave_up = true;
       LOGE("still no profile after waiting; the daemon never pushed a config (missing or invalid "
            "keybox?). Reporting the hardware as not yet available — an app that gives up here may "
            "regenerate its key and lose whatever it had encrypted");
@@ -232,7 +234,6 @@ TaPtr WaitForDefaultTa(SecurityLevel level) {
     }
     LOGI("config arrived while waiting; serving the operation");
   }
-  gave_up = false;
   return g_profiles.front().TaFor(level);
 }
 
@@ -1232,6 +1233,7 @@ extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err
     g_profiles = std::move(g_staging);
     g_staging.clear();
     g_strongbox_ok = g_stage_strongbox_ok;
+    g_cfg_wait_gave_up = false;
     n = static_cast<int>(g_profiles.size());
   }
   // Release anything parked in WaitForDefaultTa now that there is a TA to serve it.
