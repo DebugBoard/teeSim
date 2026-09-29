@@ -46,6 +46,15 @@ object App {
     // resolveAndPush holds) keeps polls single-file without blocking the config path across the
     // multi-second fetch.
     private val usagePollLock = Any()
+    // The last reported snapshot, so pollUsageOnce logs a change rather than every fifteen-second
+    // tick. Both the reported and the merged count are compared (apps.length() alone can repeat
+    // while individual counters still climb), so silence means "nothing changed".
+    @Volatile private var lastPollReported = -1
+    @Volatile private var lastPollMerged = -1
+    // A DEBUG line every this many polls, confirming the thread is alive during a long silent
+    // stretch.
+    private const val USAGE_POLL_HEARTBEAT_EVERY = 40 // ~10 minutes at USAGE_POLL_MS
+    private var usagePollTick = 0
 
     // Shared body of the owner-scoped helper children the daemon spawns (see main). keystore2
     // authorizes an owner-only operation on a key by the caller's EFFECTIVE uid, so we seteuid to
@@ -62,14 +71,14 @@ object App {
             android.system.Os.seteuid(uid)
         } catch (e: Throwable) {
             SystemLogger.warning(
-                "$label: seteuid($uid) failed: ${e.javaClass.simpleName}: ${e.message}"
+                "App.runAsOwner: $label seteuid($uid) failed: ${e.javaClass.simpleName}: ${e.message}"
             )
             return 2
         }
         return try {
             if (action()) 0 else 1
         } catch (e: Throwable) {
-            SystemLogger.warning("$label: keystore2 call as euid=$uid failed", e)
+            SystemLogger.warning("App.runAsOwner: $label keystore2 call as euid=$uid failed", e)
             1
         }
     }
@@ -91,7 +100,7 @@ object App {
             chain = java.io.File(chainPath).readBytes()
         } catch (e: Throwable) {
             SystemLogger.warning(
-                "resign-helper: reading cert files failed: ${e.javaClass.simpleName}: ${e.message}"
+                "App.runResignHelper: reading cert files failed: ${e.javaClass.simpleName}: ${e.message}"
             )
             return 1
         }
@@ -121,11 +130,14 @@ object App {
                 )
             )
         }
-        SystemLogger.info("TEESimulator control daemon starting")
+        SystemLogger.info("App: daemon starting")
         // Start the in-process log reader first, so even the boot-time bootstrap below is captured
         // for the WebUI's Logs panel (the reader is a native thread; it does not depend on the
         // framework).
         startLogReader(resolveModuleDir(args))
+        // Written into the log itself, not only into a bundle: a log usually reaches an issue as
+        // pasted text, which must identify the module version, the device and the date on its own.
+        Report.logHeader()
         try {
             waitForSystemReady()
             appContext = prepareEnvironment()
@@ -189,10 +201,10 @@ object App {
             KeyAdmin.onRescan = { resolveAndPush() }
             startUsagePoll()
 
-            SystemLogger.info("Daemon initialised; entering main loop")
+            SystemLogger.info("App: daemon initialised; entering main loop")
             Looper.loop()
         } catch (e: Throwable) {
-            SystemLogger.error("Fatal error in daemon main", e)
+            SystemLogger.error("App: fatal error in daemon main", e)
             throw e
         }
     }
@@ -221,7 +233,7 @@ object App {
                 return
             }
         }
-        SystemLogger.warning("system_server not ready after 70s; bootstrapping anyway")
+        SystemLogger.warning("App: system_server not ready after 70s; bootstrapping anyway")
     }
 
     /** Minimal ActivityThread bootstrap so KeyStore.getApplicationContext() works. */
@@ -239,7 +251,9 @@ object App {
                 systemContext = activityThread.getSystemContext()
                 if (systemContext != null) break
             } catch (e: Throwable) {
-                SystemLogger.warning("getSystemContext attempt ${attempt + 1} failed: ${e.message}")
+                SystemLogger.warning(
+                    "App: getSystemContext attempt ${attempt + 1} failed: ${e.message}"
+                )
             }
             try {
                 Thread.sleep(1000)
@@ -294,11 +308,11 @@ object App {
             if (syncMode.get(null) == null) {
                 syncMode.set(null, "NORMAL")
                 SystemLogger.info(
-                    "SQLiteGlobal.sDefaultSyncMode seeded NORMAL (skip getPkgs on DB open)"
+                    "App: SQLiteGlobal.sDefaultSyncMode seeded NORMAL (skip getPkgs on DB open)"
                 )
             }
         } catch (e: Throwable) {
-            SystemLogger.verbose("SQLiteGlobal sync-mode guard not applied: ${e.message}")
+            SystemLogger.verbose("App: SQLiteGlobal sync-mode guard not applied: ${e.message}")
         }
 
         // Stock AOSP settings dependency: present since API 28, absent on some newer builds.
@@ -317,10 +331,10 @@ object App {
                     .apply { isAccessible = true }
                     .setBoolean(null, true)
                 SystemLogger.info(
-                    "SQLiteCompatibilityWalFlags neutralised (skip Settings.Global on DB open)"
+                    "App: SQLiteCompatibilityWalFlags neutralised (skip Settings.Global on DB open)"
                 )
             } catch (e: Throwable) {
-                SystemLogger.warning("Could not neutralise SQLiteCompatibilityWalFlags", e)
+                SystemLogger.warning("App: cannot neutralise SQLiteCompatibilityWalFlags", e)
             }
         }
     }
@@ -341,9 +355,9 @@ object App {
         try {
             lastGoodConfig = ConfigStore.load()
         } catch (e: ConfigStore.ConfigException) {
-            SystemLogger.error("config.json invalid; keeping last-good: ${e.message}")
+            SystemLogger.error("App: config.json invalid; keeping last-good: ${e.message}")
         } catch (e: Exception) {
-            SystemLogger.error("config.json read failed; keeping last-good", e)
+            SystemLogger.error("App: config.json read failed; keeping last-good", e)
         }
         val cfg =
             lastGoodConfig
@@ -355,7 +369,7 @@ object App {
                     // delete the alias and mint a fresh key, losing everything the old one had
                     // encrypted. So this is not a quiet "nothing to do" state.
                     SystemLogger.error(
-                        "No valid config to push — keys minted by TEESimulator cannot be used until " +
+                        "App: no valid config to push — keys minted by TEESimulator cannot be used until " +
                             "one exists, and an app that gives up on such a key may regenerate it " +
                             "and lose the data it had encrypted. Fix config.json/the keybox."
                     )
@@ -366,7 +380,7 @@ object App {
             Control.push(msg.toString())
             countTargetUids(msg)
         } catch (e: Exception) {
-            SystemLogger.error("Failed to resolve/push config", e)
+            SystemLogger.error("App: resolving/pushing config failed", e)
             -1
         }
     }
@@ -400,7 +414,7 @@ object App {
             isDaemon = true
             start()
         }
-        SystemLogger.info("Usage poll thread started (every ${USAGE_POLL_MS}ms)")
+        SystemLogger.info("App: usage poll thread started (every ${USAGE_POLL_MS}ms)")
     }
 
     private fun usagePollLoop() {
@@ -413,7 +427,7 @@ object App {
             try {
                 pollUsageOnce()
             } catch (e: Throwable) {
-                SystemLogger.warning("usage poll: iteration failed: ${e.message}")
+                SystemLogger.warning("App: usage poll iteration failed: ${e.message}")
             }
         }
     }
@@ -457,7 +471,18 @@ object App {
                 UsageStore.applyLibSample(uid, token, current, lastUsedEpoch)
                 recorded++
             }
-            SystemLogger.info("usage poll: ${apps.length()} uid(s) reported, $recorded merged")
+            val reported = apps.length()
+            usagePollTick++
+            if (reported != lastPollReported || recorded != lastPollMerged) {
+                SystemLogger.info("App: usage poll $reported uid(s) reported, $recorded merged")
+                lastPollReported = reported
+                lastPollMerged = recorded
+            } else if (usagePollTick % USAGE_POLL_HEARTBEAT_EVERY == 0) {
+                SystemLogger.debug(
+                    "App: usage poll unchanged ($reported uid(s), $recorded merged) for " +
+                        "$USAGE_POLL_HEARTBEAT_EVERY polls"
+                )
+            }
         }
 
     /**
@@ -475,7 +500,7 @@ object App {
             if (live != value) {
                 SysProp.set(prop, value)
                 SystemLogger.info(
-                    "boot prop: forced $prop to the attested value (was '${live.ifEmpty { "unset" }}')"
+                    "App: boot prop forced $prop to the attested value (was '${live.ifEmpty { "unset" }}')"
                 )
             }
         }

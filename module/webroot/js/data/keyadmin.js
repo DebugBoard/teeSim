@@ -184,6 +184,13 @@ const logsWriteQuery = (args) =>
   "?dir=" + encodeURIComponent((args && args.dir) || "") +
   "&name=" + encodeURIComponent((args && args.name) || "");
 
+// The bug-report bundle. Redaction is on unless explicitly turned off, and package names are kept
+// unless explicitly mapped — they are load-bearing for triage.
+const reportQuery = (args) =>
+  logsWriteQuery(args) +
+  ((args && args.redact === false) ? "&redact=0" : "") +
+  ((args && args.mapPackages) ? "&mapPackages=1" : "");
+
 export async function keyAdmin(action, args = {}) {
   switch (action) {
     case "status":
@@ -224,6 +231,11 @@ export async function keyAdmin(action, args = {}) {
       return request("GET", "/logs" + logsQuery(args));
     case "logsWrite":
       return request("POST", "/logs/write" + logsWriteQuery(args), args.text);
+    case "report":
+      // The daemon assembles the zip and writes it itself — the whole rotation, the config, a
+      // property allowlist and the installed-module list, redacted on the way past. Nothing passes
+      // through this bridge but the request and the resulting path.
+      return request("POST", "/report" + reportQuery(args));
     case "keyboxInspect":
       // refresh:true has the daemon re-fetch Google's revocation list (fresh, cache-busted) before
       // re-checking — the keybox inspector's pull-to-refresh sets it.

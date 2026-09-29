@@ -51,7 +51,7 @@ object VbMeta {
         try {
             compute()?.digest
         } catch (e: Throwable) {
-            SystemLogger.warning("vbmeta digest: computation failed: ${e.message}")
+            SystemLogger.warning("VbMeta: digest computation failed: ${e.message}")
             null
         }
 
@@ -71,14 +71,14 @@ object VbMeta {
         val topAlg = ByteBuffer.wrap(top).order(ByteOrder.BIG_ENDIAN).getInt(28)
         val useSha512 = topAlg in 4..6
 
-        walk("vbmeta", slot, top, order, blob, visited)
+        if (!walk("vbmeta", slot, top, order, blob, visited)) return null
 
         val bytes = blob.toByteArray()
         val digest =
             MessageDigest.getInstance(if (useSha512) "SHA-512" else "SHA-256").digest(bytes)
         val label = if (useSha512) "sha512" else "sha256"
         SystemLogger.info(
-            "vbmeta digest: computed ${digest.toHex()} ($label) over ${order.size} struct(s) " +
+            "VbMeta: digest computed ${digest.toHex()} ($label) over ${order.size} struct(s) " +
                 "[${order.joinToString(",")}] ${bytes.size}B"
         )
         return Result(
@@ -90,8 +90,10 @@ object VbMeta {
     }
 
     /**
-     * Append [blob] (the vbmeta struct of [baseName]) then recurse into its chain partitions in
-     * order.
+     * Appends `blob` and recurses into every chain partition it references, in order. Returns false
+     * the instant any chained partition cannot be read or the chain runs away past
+     * [MAX_PARTITIONS]: a digest hashed over an incomplete set of structs would be wrong yet
+     * indistinguishable from a correct one, so it is either the real digest or nothing.
      */
     private fun walk(
         baseName: String,
@@ -100,16 +102,32 @@ object VbMeta {
         order: MutableList<String>,
         out: ByteArrayBuilder,
         visited: MutableSet<String>,
-    ) {
-        if (baseName in visited || visited.size >= MAX_PARTITIONS) return
+    ): Boolean {
+        if (baseName in visited) return true // already included via another chain; not a failure
+        if (visited.size >= MAX_PARTITIONS) {
+            SystemLogger.warning(
+                "VbMeta: digest aborting; chain exceeds $MAX_PARTITIONS partitions (cycle or " +
+                    "malformed chain)"
+            )
+            return false
+        }
         visited.add(baseName)
         order.add(baseName)
         out.append(blob)
 
         for (child in chainPartitions(blob)) {
-            val childBlob = readVbmetaBlob("$child$slot") ?: continue
-            walk(child, slot, childBlob, order, out, visited)
+            val childName = "$child$slot"
+            val childBlob = readVbmetaBlob(childName)
+            if (childBlob == null) {
+                SystemLogger.warning(
+                    "VbMeta: digest chain partition '$childName' (referenced by '$baseName') " +
+                        "could not be read; aborting rather than hashing an incomplete chain"
+                )
+                return false
+            }
+            if (!walk(child, slot, childBlob, order, out, visited)) return false
         }
+        return true
     }
 
     /** The chain-partition names referenced by a vbmeta struct's descriptors, in order. */
@@ -164,7 +182,9 @@ object VbMeta {
             }
             val header = readAt(path, vbOffset, HEADER_SIZE)
             if (header.size < HEADER_SIZE || ascii(header, 0, 4) != VBMETA_MAGIC) {
-                SystemLogger.info("vbmeta digest: $name has no AVB0 struct at offset $vbOffset")
+                // A null here fails the whole digest computation (walk() aborts on a missing chain
+                // partition), so it is a warning.
+                SystemLogger.warning("VbMeta: digest $name has no AVB0 struct at offset $vbOffset")
                 return null
             }
             val hb = ByteBuffer.wrap(header).order(ByteOrder.BIG_ENDIAN)
@@ -173,10 +193,10 @@ object VbMeta {
             val total = (HEADER_SIZE + authSize + auxSize).toInt()
             readAt(path, vbOffset, total)
         } catch (e: ErrnoException) {
-            SystemLogger.info("vbmeta digest: cannot read $name ($path): ${e.message}")
+            SystemLogger.warning("VbMeta: digest cannot read $name ($path): ${e.message}")
             null
         } catch (e: Throwable) {
-            SystemLogger.warning("vbmeta digest: parse of $name failed: ${e.message}")
+            SystemLogger.warning("VbMeta: digest parse of $name failed: ${e.message}")
             null
         }
     }

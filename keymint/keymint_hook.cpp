@@ -14,6 +14,7 @@
 #include <android/binder_status.h>
 
 #include <sys/system_properties.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cstdlib>
@@ -23,6 +24,9 @@
 #include <set>
 #include <string>
 
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "km/hook"
+#include "keymint_hook.h"
 #include "logging.hpp"
 #include "lsplt.hpp"
 
@@ -108,6 +112,25 @@ bool IsKeyMintProxy(AIBinder* binder) {
   return !IsOurDevice(binder);
 }
 
+// What the RKP gate below decided on this thread, and for which uid. keystore2 resolves the
+// remote-provisioning key on the app's own binder thread while it is still serving that app's
+// generateKey, so the router can read this back and state, on the generateKey line itself, why the
+// request did or did not arrive carrying a real attest key. "none" means the gate never ran on this
+// thread — which is the answer whenever a request turns up with an attest key we never saw fetched.
+thread_local const char* tls_rkp_verdict = "none";
+thread_local int32_t tls_rkp_uid = -1;
+// The request id the gate's own line carried, and when the verdict was recorded, so the router can
+// say both which line this verdict came from and whether it is fresh enough to belong to the
+// request in hand.
+thread_local uint32_t tls_rkp_rid = 0;
+thread_local uint64_t tls_rkp_at_ms = 0;
+
+uint64_t NowMonoMs() {
+  struct timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000u + static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
+}
+
 // The framework RKP front-end keystore2 asks for a remote-provisioned attestation key. keystore2
 // resolves it by calling IRemoteProvisioning.getRegistration on this binder; failing that transact
 // makes keystore2 fall back to "no attest key" (get_attest_key_info -> Ok(None)) on a hybrid device,
@@ -146,7 +169,7 @@ void LogRkpPolicySnapshot() {
   for (const char* name : kProps) {
     char buf[PROP_VALUE_MAX] = {0};
     int n = __system_property_get(name, buf);
-    LOGI("RKP policy: %s=%s", name, n > 0 ? buf : "<unset>");
+    LOGI("LogRkpPolicySnapshot: %s=%s", name, n > 0 ? buf : "<unset>");
   }
 }
 
@@ -247,24 +270,47 @@ binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParce
     // property matching this getRegistration's target (its irpcName) rather than the TEE one alone.
     if (IsRkpProvisioning(binder)) {
       int32_t uid = static_cast<int32_t>(AIBinder_getCallingUid());
-      if (teesim_is_target_uid(uid)) {
+      // The gate runs on the app's binder thread but outside any hooked entry point, so it stamps
+      // its own context; the rid it records ties the verdict back to the line that made it.
+      char rkp_ctx[64];
+      tls_rkp_rid = teesim_log_new_rid();
+      snprintf(rkp_ctx, sizeof(rkp_ctx), "[%d r%04x] ", uid, tls_rkp_rid);
+      LogContext lc_(rkp_ctx);
+      tls_rkp_uid = uid;
+      tls_rkp_at_ms = NowMonoMs();
+      if (!teesim_is_target_uid(uid)) {
+        // Not a target *at this instant*: either the app really is out of scope, or the scope is
+        // stale (a reinstall gave it a new uid and no re-resolve has run yet), or the lookup did not
+        // arrive on the app's binder thread and this uid is not the app's at all. All three end the
+        // same way — keystore2 gets a real, remotely provisioned attest key, and a leaf signed under
+        // it keeps the REAL root of trust because we do not hold that key's private half. Say so
+        // here; a silent allow is indistinguishable from never having been asked.
+        tls_rkp_verdict = "allowed-not-target";
+        LOGD("HookedTransact: RKP allowing IRemoteProvisioning transact code=%u for uid=%d (not a "
+             "target uid at this moment; keystore2 may inject a real attest key we cannot re-root)",
+             code, uid);
+      } else {
         std::string irpc_name;
         bool strongbox = GetRegIsStrongBox(binder, *in, &irpc_name);
         const char* prop = strongbox ? "remote_provisioning.strongbox.rkp_only"
                                       : "remote_provisioning.tee.rkp_only";
-        const char* level = strongbox ? "strongbox" : "TE";
+        const char* level = strongbox ? "StrongBox" : "TEE";
         const char* irpc = irpc_name.empty() ? "<unreadable>" : irpc_name.c_str();
         char raw[PROP_VALUE_MAX] = {0};
         bool rkp_only = ReadRkpOnly(prop, raw);
         const char* val = raw[0] ? raw : "<unset>";
         if (rkp_only) {
-          LOGI("RKP: NOT denying %s getRegistration for target uid=%d (irpcName=%s, %s=%s; denial "
-               "would fail key generation on an rkp-only level)",
+          tls_rkp_verdict = "allowed-rkp-only-level";
+          LOGI("HookedTransact: RKP NOT denying %s getRegistration for target uid=%d (irpcName=%s, "
+               "%s=%s; denial would fail key generation on an rkp-only level)",
                level, uid, irpc, prop, val);
         } else {
-          LOGI("RKP: denying %s IRemoteProvisioning transact code=%u for target uid=%d (irpcName=%s, "
-               "%s=%s; keystore2 will append no real attest-key chain; our generation stays "
-               "keybox-rooted)",
+          tls_rkp_verdict = "denied";
+          // The gate only knows what keystore2 will now do, not how the key will be rooted: a
+          // patch-mode profile keeps real hardware with only its leaf re-signed.
+          // DEBUG: the generateKey line that follows reports this verdict as rkp_gate=denied(...).
+          LOGD("HookedTransact: RKP denying %s IRemoteProvisioning transact code=%u for target uid=%d "
+               "(irpcName=%s, %s=%s; keystore2 will append no real attest-key chain)",
                level, code, uid, irpc, prop, val);
           AParcel_delete(*in);  // honour AIBinder_transact's ownership of the input parcel
           *in = nullptr;
@@ -285,6 +331,23 @@ binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParce
 }  // namespace
 
 extern "C" void teesim_hook_set_forwarding(bool forwarding) { tls_forwarding = forwarding; }
+
+// The RKP gate's verdict for this thread, for the router to print on its generateKey line. Reading
+// it clears it, so a later request that never reaches the gate reports "none" rather than inheriting
+// the previous request's answer from the same binder thread. The age is what catches the case
+// clearing cannot: a verdict armed for a request keystore2 then abandoned stays latched on the
+// thread until something reads it, and only its age says it is not this request's.
+extern "C" void teesim_hook_take_rkp_verdict(TsRkpVerdict* out) {
+  if (!out) return;
+  out->verdict = tls_rkp_verdict;
+  out->uid = tls_rkp_uid;
+  out->rid = tls_rkp_rid;
+  out->age_ms = tls_rkp_at_ms != 0 ? static_cast<uint32_t>(NowMonoMs() - tls_rkp_at_ms) : 0;
+  tls_rkp_verdict = "none";
+  tls_rkp_uid = -1;
+  tls_rkp_rid = 0;
+  tls_rkp_at_ms = 0;
+}
 
 // Only hook real ELF modules: the main executable and shared libraries. Feeding
 // LSPlt a non-ELF mapping (fonts, dex, oat, apk) makes its ELF parser fault.
@@ -327,12 +390,12 @@ extern "C" bool teesim_hook_install() {
   if (!exe.empty()) {
     register_and_commit(/*exe_only=*/true);
     if (real_transact != nullptr) {
-      LOGI("hook: AIBinder_transact patched in the main executable (%s)", exe.c_str());
+      LOGI("teesim_hook_install: AIBinder_transact patched in the main executable (%s)", exe.c_str());
       return true;
     }
   }
   register_and_commit(/*exe_only=*/false);
-  LOGI("hook: AIBinder_transact %s after full ELF scan",
+  LOGI("teesim_hook_install: AIBinder_transact %s after full ELF scan",
        real_transact != nullptr ? "patched" : "not found (no importer)");
   return real_transact != nullptr;
 }

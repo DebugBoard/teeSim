@@ -31,6 +31,7 @@ object Resolver {
         val msg = JSONObject()
         msg.put("type", "config")
         msg.put("epoch", epochSeq.incrementAndGet())
+        msg.put("redactSalt", Redact.saltBase64())
 
         msg.put(
             "bootInfo",

@@ -28,10 +28,15 @@ object OverrideStore {
             val o = JSONObject(f.readText())
             val m = LinkedHashMap<String, String>()
             for (k in o.keys()) m[k] = o.optString(k, "")
-            SystemLogger.info("Overrides loaded: ${m.keys.joinToString(",").ifEmpty { "(none)" }}")
+            SystemLogger.info(
+                "OverrideStore: loaded ${m.keys.joinToString(",").ifEmpty { "(none)" }}"
+            )
             m
         } catch (e: Exception) {
-            SystemLogger.warning("Could not read overrides.json; ignoring user overrides", e)
+            SystemLogger.warning(
+                "OverrideStore: cannot read overrides.json; ignoring user overrides",
+                e,
+            )
             emptyMap()
         }
     }

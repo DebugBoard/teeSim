@@ -45,7 +45,10 @@ object ConfigStore {
         val autoIncludeNewApps: Boolean,
     )
 
-    data class Config(val version: Int, val profiles: List<ProfileConfig>)
+    data class Config(
+        val version: Int,
+        val profiles: List<ProfileConfig>,
+    )
 
     /** Parse and validate the on-disk config. Throws [ConfigException] if invalid. */
     fun load(): Config {
@@ -206,12 +209,12 @@ object ConfigStore {
                 override fun onEvent(event: Int, path: String?) {
                     path ?: return
                     if (path == "config.json" || path.endsWith(".xml")) {
-                        SystemLogger.info("Config change detected: $path")
+                        SystemLogger.info("ConfigStore: change detected in $path")
                         onChange()
                     }
                 }
             }
         observer?.startWatching()
-        SystemLogger.info("Watching ${Const.DATA_DIR} for config/keybox changes")
+        SystemLogger.info("ConfigStore: watching ${Const.DATA_DIR} for config/keybox changes")
     }
 }

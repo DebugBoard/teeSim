@@ -45,7 +45,7 @@ object ReAttest {
         val needRestart = KeystoreDb.deleteTargetAttestKeys(uids)
         if (needRestart == 0) return false
         SystemLogger.info(
-            "re-attest: $needRestart attest key(s) fell back to a database delete; restarting keystore2 to evict them from its cache"
+            "ReAttest: $needRestart attest key(s) fell back to a database delete; restarting keystore2 to evict them from its cache"
         )
         return restartKeystore2()
     }
@@ -63,12 +63,12 @@ object ReAttest {
             val out = p.inputStream.bufferedReader().readText().trim()
             p.waitFor()
             SystemLogger.info(
-                "re-attest: requested keystore2 restart (exit ${p.exitValue()}${if (out.isEmpty()) "" else ", $out"})"
+                "ReAttest: requested keystore2 restart (exit ${p.exitValue()}${if (out.isEmpty()) "" else ", $out"})"
             )
             true
         } catch (e: Throwable) {
             SystemLogger.warning(
-                "re-attest: could not restart keystore2; the purge will take effect on next boot",
+                "ReAttest: could not restart keystore2; the purge will take effect on next boot",
                 e,
             )
             false
@@ -88,7 +88,7 @@ object ReAttest {
 
         val keys = KeystoreDb.attestedKeys(uidToProfile.keys)
         SystemLogger.info(
-            "re-attest: ${keys.size} pre-existing target key(s) to re-root across ${uidToProfile.size} uid(s)"
+            "ReAttest: ${keys.size} pre-existing target key(s) to re-root across ${uidToProfile.size} uid(s)"
         )
         if (keys.isEmpty()) return
 
@@ -100,7 +100,7 @@ object ReAttest {
                 Control.resign(profileId, key.leaf)
                     ?: run {
                         SystemLogger.warning(
-                            "re-attest: key id=${key.id} uid=${key.uid} — resign failed; skipping"
+                            "ReAttest: key id=${key.id} uid=${key.uid} — resign failed; skipping"
                         )
                         continue
                     }
@@ -115,7 +115,7 @@ object ReAttest {
             if (Keystore2Service.updateSubcomponentAsUid(key.id, key.uid, leaf, rest) == 0) {
                 done++
                 SystemLogger.info(
-                    "re-attest: key id=${key.id} uid=${key.uid} profile=$profileId re-rooted (${chain.size}-cert chain)"
+                    "ReAttest: key id=${key.id} uid=${key.uid} profile=$profileId re-rooted (${chain.size}-cert chain)"
                 )
             } else {
                 dbFallback.add(KeystoreDb.CertUpdate(key.id, leaf, rest))
@@ -123,13 +123,13 @@ object ReAttest {
         }
         if (dbFallback.isNotEmpty()) {
             SystemLogger.warning(
-                "re-attest: keystore2 refused the owner update for ${dbFallback.size} key(s); " +
+                "ReAttest: keystore2 refused the owner update for ${dbFallback.size} key(s); " +
                     "falling back to a direct database write"
             )
             done += KeystoreDb.updateSubcomponents(uidToProfile.keys, dbFallback)
         }
         SystemLogger.info(
-            "re-attest: re-rooted $done of ${keys.size} pre-existing target key(s) to the keybox"
+            "ReAttest: re-rooted $done of ${keys.size} pre-existing target key(s) to the keybox"
         )
     }
 

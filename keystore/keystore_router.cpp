@@ -34,7 +34,10 @@
 #include <vector>
 
 #include "control.h"
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "ks1"
 #include "logging.hpp"
+#include "km_names.h"
 #include "teesim_km.h"
 
 using namespace android;
@@ -61,6 +64,34 @@ bool IsAndroidR() {
 const TxCodes& Codes() {
   static const TxCodes& codes = IsAndroidR() ? kTxR : kTxQ;
   return codes;
+}
+
+// The IKeystoreService method a transaction code names on this release, for the log.
+const char* TxName(uint32_t code) {
+  const TxCodes& tx = Codes();
+  if (code == tx.generateKey) return "generateKey";
+  if (code == tx.getKeyCharacteristics) return "getKeyCharacteristics";
+  if (code == tx.exportKey) return "exportKey";
+  if (code == tx.attestKey) return "attestKey";
+  if (code == tx.begin) return "begin";
+  if (code == tx.update) return "update";
+  if (code == tx.finish) return "finish";
+  if (code == tx.abort) return "abort";
+  return "?";
+}
+
+// KeyPurpose by name (keymaster and KeyMint share the numbering).
+const char* PurposeName(int32_t purpose) {
+  switch (purpose) {
+    case 0: return "ENCRYPT";
+    case 1: return "DECRYPT";
+    case 2: return "SIGN";
+    case 3: return "VERIFY";
+    case 5: return "WRAP_KEY";
+    case 6: return "AGREE_KEY";
+    case 7: return "ATTEST_KEY";
+    default: return "?";
+  }
 }
 
 // KeyMint/Keymaster tag values (shared) and enum constants we need.
@@ -350,11 +381,16 @@ bool MarshalEcPkcs8(const EC_KEY* ec, std::vector<uint8_t>& out) {
       !CBB_add_bytes(&oid, kEcPublicKeyOid, sizeof(kEcPublicKeyOid)) ||
       !EC_KEY_marshal_curve_name(&algorithm, EC_KEY_get0_group(ec)) ||
       !CBB_add_asn1(&info, &private_key, CBS_ASN1_OCTETSTRING) ||
-      !EC_KEY_marshal_private_key(&private_key, ec, 0))  // 0: keep curve and public key
+      !EC_KEY_marshal_private_key(&private_key, ec, 0)) {  // 0: keep curve and public key
+    LOGE("MarshalEcPkcs8: FAILED, could not build the PrivateKeyInfo");
     return false;
+  }
   uint8_t* der = nullptr;
   size_t dlen = 0;
-  if (!CBB_finish(cbb.get(), &der, &dlen)) return false;
+  if (!CBB_finish(cbb.get(), &der, &dlen)) {
+    LOGE("MarshalEcPkcs8: FAILED, could not finish the PrivateKeyInfo");
+    return false;
+  }
   out.assign(der, der + dlen);
   OPENSSL_free(der);
   return true;
@@ -372,34 +408,54 @@ bool GenerateKeyPair(const std::vector<KmParam>& params, PendingKey& out) {
     else if (curve == 2) nid = NID_secp384r1;
     else if (curve == 3) nid = NID_secp521r1;
     bssl::UniquePtr<EC_KEY> ec(EC_KEY_new_by_curve_name(nid));
-    if (!ec || !EC_KEY_generate_key(ec.get())) return false;
-    if (!EVP_PKEY_assign_EC_KEY(pkey.get(), ec.release())) return false;
+    if (!ec || !EC_KEY_generate_key(ec.get())) {
+      LOGE("GenerateKeyPair: FAILED, EC keygen on %s", OBJ_nid2sn(nid));
+      return false;
+    }
+    if (!EVP_PKEY_assign_EC_KEY(pkey.get(), ec.release())) {
+      LOGE("GenerateKeyPair: FAILED, could not take ownership of the EC key");
+      return false;
+    }
   } else {
     int64_t bits = ParamInt(params, TAG_KEY_SIZE, 2048);
     bssl::UniquePtr<RSA> rsa(RSA_new());
     bssl::UniquePtr<BIGNUM> e(BN_new());
     BN_set_word(e.get(), RSA_F4);
-    if (!RSA_generate_key_ex(rsa.get(), static_cast<int>(bits), e.get(), nullptr)) return false;
-    if (!EVP_PKEY_assign_RSA(pkey.get(), rsa.release())) return false;
+    if (!RSA_generate_key_ex(rsa.get(), static_cast<int>(bits), e.get(), nullptr)) {
+      LOGE("GenerateKeyPair: FAILED, RSA-%lld keygen", static_cast<long long>(bits));
+      return false;
+    }
+    if (!EVP_PKEY_assign_RSA(pkey.get(), rsa.release())) {
+      LOGE("GenerateKeyPair: FAILED, could not take ownership of the RSA key");
+      return false;
+    }
   }
 
   if (algorithm == ALGORITHM_EC) {
-    if (!MarshalEcPkcs8(EVP_PKEY_get0_EC_KEY(pkey.get()), out.pkcs8)) return false;
+    if (!MarshalEcPkcs8(EVP_PKEY_get0_EC_KEY(pkey.get()), out.pkcs8)) {
+      LOGE("GenerateKeyPair: FAILED, could not marshal the EC private key to PKCS#8");
+      return false;
+    }
   } else {
     bssl::ScopedCBB cbb;
     uint8_t* der = nullptr;
     size_t dlen = 0;
     CBB_init(cbb.get(), 0);
     if (!EVP_marshal_private_key(cbb.get(), pkey.get()) ||  // PKCS#8 PrivateKeyInfo
-        !CBB_finish(cbb.get(), &der, &dlen))
+        !CBB_finish(cbb.get(), &der, &dlen)) {
+      LOGE("GenerateKeyPair: FAILED, could not marshal the RSA private key to PKCS#8");
       return false;
+    }
     out.pkcs8.assign(der, der + dlen);
     OPENSSL_free(der);
   }
 
   uint8_t* der = nullptr;
   int len = i2d_PUBKEY(pkey.get(), &der);  // SubjectPublicKeyInfo
-  if (len <= 0) return false;
+  if (len <= 0) {
+    LOGE("GenerateKeyPair: FAILED, could not encode the SubjectPublicKeyInfo");
+    return false;
+  }
   out.spki.assign(der, der + len);
   OPENSSL_free(der);
   return true;
@@ -467,28 +523,47 @@ TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmPa
                                     KEY_FORMAT_PKCS8, k.pkcs8.data(), k.pkcs8.size(), nullptr, 0,
                                     nullptr, 0, nullptr, 0, &res);
   if (rc != 0 || !res) {
-    LOGE("keystore: TA import_key failed rc=%d", rc);
+    LOGE("ImportKey: TA import_key failed rc=%d(%s)", rc, teesim_km_err_name(rc));
     return nullptr;
   }
   return res;
+}
+
+// Milliseconds on CLOCK_MONOTONIC, for the "how long did this take" fields.
+uint64_t NowMonoMs() {
+  struct timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000u + static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
 }
 
 // Make sure the key exists in the TA (generating the key pair first if needed) so
 // crypto operations can run against it. Call with g_keys_mutex held.
 bool EnsureTaKey(PendingKey& k, int uid) {
   if (!k.ta_blob.empty()) return true;
-  if (k.pkcs8.empty() && !GenerateKeyPair(k.params, k)) return false;
+  // HandleGenerateKey only records a PendingKey; the key pair is actually generated here, on
+  // whichever later call first needs it, so the cost of an RSA-2048 keygen inside an unrelated
+  // transaction is timed and logged.
+  const uint64_t t0 = NowMonoMs();
+  if (k.pkcs8.empty() && !GenerateKeyPair(k.params, k)) {
+    LOGE("EnsureTaKey: FAILED, key pair generation");
+    return false;
+  }
   // Import through the regular attestation path with a fixed challenge; only the
   // resulting key blob matters here, and that path is well exercised.
   static const uint8_t kChallenge[16] = {0};
   std::vector<KmParam> extra = {{TAG_ATTESTATION_CHALLENGE, 0, kChallenge, sizeof(kChallenge)}};
   TsCreationResult* res = ImportKey(k, uid, extra, true);
-  if (!res) return false;
+  if (!res) {
+    LOGE("EnsureTaKey: FAILED, importing the generated key into the TA");
+    return false;
+  }
   const uint8_t* ptr = nullptr;
   size_t len = 0;
   teesim_km_result_key_blob(res, &ptr, &len);
   k.ta_blob.assign(ptr, ptr + len);
   teesim_km_free_result(res);
+  LOGI("EnsureTaKey: key materialised in the TA, blob_len=%zu %llums", k.ta_blob.size(),
+       static_cast<unsigned long long>(NowMonoMs() - t0));
   return true;
 }
 
@@ -514,6 +589,8 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
   std::vector<std::vector<uint8_t>> blobs;
   std::vector<KmParam> params;
   if (in.readInt32() == 1) params = ReadKeymasterArguments(in, blobs);
+  LOGI("generateKey: alias=%s params=%s", String8(alias).c_str(),
+       KmDescribeParams(params.data(), params.size()).c_str());
 
   PendingKey key;
   key.params = std::move(params);
@@ -523,7 +600,7 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     g_keys[KeyId(uid, alias)] = std::move(key);
   }
-  LOGI("keystore: generateKey simulated alias=%s", String8(alias).c_str());
+  LOGI("generateKey: simulated alias=%s", String8(alias).c_str());
 
   static const String16 kCb("android.security.keystore.IKeystoreKeyCharacteristicsCallback");
   InvokeCallback(cb, kCb, [](Parcel& p) {
@@ -543,7 +620,10 @@ bool HandleGetKeyCharacteristics(int uid, Parcel& in, Parcel* reply) {
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
+    if (it == g_keys.end()) {
+      LOGD("getKeyCharacteristics: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
     params = it->second.params;
   }
   static const String16 kCb("android.security.keystore.IKeystoreKeyCharacteristicsCallback");
@@ -565,9 +645,12 @@ bool HandleExportKey(int uid, Parcel& in, Parcel* reply) {
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
+    if (it == g_keys.end()) {
+      LOGD("exportKey: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
     if (!EnsureTaKey(it->second, uid)) {
-      LOGE("keystore: key setup failed");
+      LOGE("exportKey: key setup failed");
       return false;
     }
     spki = it->second.spki;
@@ -589,13 +672,20 @@ bool HandleAttestKey(int uid, Parcel& in, Parcel* reply) {
   std::vector<std::vector<uint8_t>> blobs;
   std::vector<KmParam> attest_params;
   if (in.readInt32() == 1) attest_params = ReadKeymasterArguments(in, blobs);
+  LOGI("attestKey: params=%s", KmDescribeParams(attest_params.data(), attest_params.size()).c_str());
 
   PendingKey key;
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
-    if (it->second.pkcs8.empty() && !GenerateKeyPair(it->second.params, it->second)) return false;
+    if (it == g_keys.end()) {
+      LOGD("attestKey: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
+    if (it->second.pkcs8.empty() && !GenerateKeyPair(it->second.params, it->second)) {
+      LOGE("attestKey: FAILED, key pair generation");
+      return false;
+    }
     key = it->second;        // deep-copies param_blobs, but the params still point into the source...
     key.RebindParamBlobs();  // ...so repoint them into this copy's own storage
   }
@@ -605,7 +695,10 @@ bool HandleAttestKey(int uid, Parcel& in, Parcel* reply) {
   for (const auto& p : attest_params)
     if (p.tag == TAG_ATTESTATION_CHALLENGE) extra.push_back(p);
   TsCreationResult* res = ImportKey(key, uid, extra, /*with_attestation=*/true);
-  if (!res) return false;
+  if (!res) {
+    LOGE("attestKey: FAILED, the TA declined to import and attest the key");
+    return false;
+  }
 
   // Reuse the imported key blob for later signing operations.
   {
@@ -626,7 +719,7 @@ bool HandleAttestKey(int uid, Parcel& in, Parcel* reply) {
     chain.emplace_back(ptr, ptr + len);
   }
   teesim_km_free_result(res);
-  LOGI("keystore: attestKey simulated alias=%s certs=%zu", String8(alias).c_str(), chain.size());
+  LOGI("attestKey: simulated alias=%s certs=%zu", String8(alias).c_str(), chain.size());
 
   static const String16 kCb("android.security.keystore.IKeystoreCertificateChainCallback");
   InvokeCallback(cb, kCb, [&](Parcel& p) {
@@ -659,14 +752,25 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
   {
     std::lock_guard<std::mutex> lk(g_keys_mutex);
     auto it = g_keys.find(KeyId(uid, alias));
-    if (it == g_keys.end()) return false;  // not ours; forward
-    if (!EnsureTaKey(it->second, uid)) return false;
+    if (it == g_keys.end()) {
+      LOGD("begin: alias not one of ours; forwarding to the real keystore");
+      return false;
+    }
+    if (!EnsureTaKey(it->second, uid)) {
+      LOGE("begin: FAILED, could not materialise the key in the TA");
+      return false;
+    }
     blob = it->second.ta_blob;
   }
 
   TaPtr ta = ProfileForUid(uid);
   if (!ta) ta = DefaultTa();
-  if (!ta) return false;
+  if (!ta) {
+    LOGE("begin: FAILED, no TA configured for uid %d and no default; forwarding is not possible "
+         "here because the key is ours",
+         uid);
+    return false;
+  }
   TsBeginResult* res = nullptr;
   // The legacy keystore1 HAL carries auth tokens through its own mechanism, not the flat token structs
   // the keystore2 path uses, so no auth token is forwarded here yet (unchanged behavior). Auth-bound
@@ -674,7 +778,7 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
   int32_t rc = teesim_km_begin(ta.get(), purpose, blob.data(), blob.size(), op_params.data(),
                                op_params.size(), /*auth_token=*/nullptr, &res);
   if (rc != 0 || !res) {
-    LOGE("keystore: TA begin failed rc=%d", rc);
+    LOGE("begin: TA begin failed rc=%d(%s)", rc, teesim_km_err_name(rc));
     return false;
   }
   int64_t op_handle = teesim_km_begin_op_handle(res);
@@ -685,7 +789,8 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
     std::lock_guard<std::mutex> lk(g_ops_mutex);
     g_ops[token.get()] = {token, op_handle, ta};
   }
-  LOGI("keystore: begin purpose=%d alias=%s", purpose, String8(alias).c_str());
+  LOGD("begin: purpose=%s alias=%s params=%s", PurposeName(purpose),
+       String8(alias).c_str(), KmDescribeParams(op_params.data(), op_params.size()).c_str());
 
   static const String16 kCb("android.security.keystore.IKeystoreOperationResultCallback");
   InvokeCallback(cb, kCb,
@@ -723,7 +828,10 @@ bool HandleUpdate(int /*uid*/, Parcel& in, Parcel* reply) {
 
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/false)) return false;  // not ours; forward
+  if (!OpFor(token, &op_handle, &ta, /*erase=*/false)) {
+    LOGD("update: operation token not one of ours; forwarding to the real keystore");
+    return false;
+  }
 
   uint8_t* out = nullptr;
   size_t out_len = 0;
@@ -734,7 +842,7 @@ bool HandleUpdate(int /*uid*/, Parcel& in, Parcel* reply) {
     output.assign(out, out + out_len);
     teesim_km_free_buf(out, out_len);
   } else if (rc != 0) {
-    LOGE("keystore: TA update failed rc=%d", rc);
+    LOGE("update: TA update failed rc=%d(%s)", rc, teesim_km_err_name(rc));
   }
 
   DeliverOperationResult(cb, rc, token, static_cast<int32_t>(input.size()), output);
@@ -755,7 +863,10 @@ bool HandleFinish(int /*uid*/, Parcel& in, Parcel* reply) {
 
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) return false;  // not ours; forward
+  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) {
+    LOGD("finish: operation token not one of ours; forwarding to the real keystore");
+    return false;
+  }
 
   uint8_t* out = nullptr;
   size_t out_len = 0;
@@ -768,9 +879,9 @@ bool HandleFinish(int /*uid*/, Parcel& in, Parcel* reply) {
     output.assign(out, out + out_len);
     teesim_km_free_buf(out, out_len);
   } else if (rc != 0) {
-    LOGE("keystore: TA finish failed rc=%d", rc);
+    LOGE("finish: TA finish failed rc=%d(%s)", rc, teesim_km_err_name(rc));
   }
-  LOGI("keystore: finish output=%zu", output.size());
+  LOGD("finish: output=%zu", output.size());
 
   DeliverOperationResult(cb, rc, token, static_cast<int32_t>(input.size()), output);
   ReplyStatus(reply, KS_NO_ERROR);
@@ -782,7 +893,10 @@ bool HandleAbort(int /*uid*/, Parcel& in, Parcel* reply) {
   sp<IBinder> token = in.readStrongBinder();
   int64_t op_handle = 0;
   TaPtr ta;
-  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) return false;  // not ours; forward
+  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) {
+    LOGD("abort: operation token not one of ours; forwarding to the real keystore");
+    return false;
+  }
   teesim_km_abort(ta.get(), op_handle);
 
   static const String16 kCb("android.security.keystore.IKeystoreResponseCallback");
@@ -820,7 +934,7 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
                              g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state,
                              g_stage_attest_version_tee, g_stage_attest_version_strongbox, p->ids);
   if (!ta) {
-    LOGE("keystore: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
+    LOGE("teesim_cfg_add_profile: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
     return false;
   }
   Profile prof;
@@ -835,7 +949,7 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
     if (p->uids[i] < 0) continue;
     const char* pkg = (p->uid_packages && p->uid_packages[i]) ? p->uid_packages[i] : "";
     prof.uids[p->uids[i]] = pkg;
-    LOGI("cfg:   uid %d -> package '%s'", p->uids[i], pkg);
+    LOGI("teesim_cfg_add_profile:   uid %d -> package '%s'", p->uids[i], pkg);
   }
   g_staging.push_back(std::move(prof));
   return true;
@@ -866,9 +980,28 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
       code != tx.abort)
     return false;
   int uid = IPCThreadState::self()->getCallingUid();
-  if (!IsTarget(uid)) return false;
+  // The target test comes first, and deliberately: stamping a context costs a package lookup and
+  // two string allocations, and on a busy Android 10 device most transactions are not ours. The
+  // forward line below names its own uid, so it needs no context to be attributable.
+  if (!IsTarget(uid)) {
+    LOGD("teesim_ks_handle: %s(code=%u) from uid %d is not a target; forwarding to the real keystore",
+         TxName(code), code, uid);
+    return false;
+  }
+  // Every line logged for this transaction — here, in the handlers, and inside the TA — names the
+  // app it belongs to and the request it belongs to. Only a target reaches this point, so the
+  // package is always known.
+  const std::string pkg = PackageForUid(uid);
+  char rid[16];
+  snprintf(rid, sizeof(rid), "r%04x", teesim_log_new_rid());
+  LogContext lc_("[" + std::to_string(uid) + (pkg.empty() ? "" : " " + pkg) + " " + rid + "] ");
   Reader r(data);
-  if (!r.p.enforceInterface(kServiceDescriptor)) return false;
+  if (!r.p.enforceInterface(kServiceDescriptor)) {
+    LOGW("teesim_ks_handle: %s(code=%u) from uid %d has the wrong interface descriptor; forwarding untouched",
+         TxName(code), code,
+         uid);
+    return false;
+  }
 
   bool done = false;
   if (code == tx.generateKey)                done = HandleGenerateKey(uid, r.p, reply);

@@ -17,6 +17,11 @@ import java.io.File
  * full volume into the daemon and amplified by the very reader meant to observe it. The native
  * reader filters at the source and captures nothing under its own identity, so there is no feedback
  * path to spin on.
+ *
+ * There is no level cutoff here: the emitter (common/log_context.cpp) has no floor either, so
+ * everything it sends to logd is kept in full. Filtering by level is the WebUI's display concern,
+ * applied once over the whole retained stream, so a viewer asking for Verbose sees all of it.
+ * Volume is reduced only by the emitter's rate limiter (RateOk), never by level.
  */
 object LogTail {
 
@@ -68,7 +73,7 @@ object LogTail {
         }
         // The reader thread needs a place to write before it opens its files.
         runCatching { Const.logDir.mkdirs() }
-        // Push the current target pid across in case the Injector set it before the library loaded.
+        // Push the current target pid across in case it was set before the library loaded.
         runCatching { nativeSetTargetPid(targetPid) }
         // The log reader is a debugging aid; it must NEVER take the daemon down. nativeRun can
         // still throw at call time even after a successful load (e.g. an UnsatisfiedLinkError if a

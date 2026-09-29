@@ -28,7 +28,7 @@ target_include_directories(lsplt PUBLIC ${LSPLT_JNI}/include)
 target_include_directories(lsplt PRIVATE ${LSPLT_JNI})
 
 # --- The injector -----------------------------------------------------------
-add_executable(inject injector/main.cpp injector/utils.cpp)
+add_executable(inject injector/main.cpp injector/utils.cpp common/log_context.cpp)
 target_include_directories(inject PRIVATE injector/include)
 target_link_libraries(inject PRIVATE lsplt log)
 target_link_options(inject PRIVATE -static-libstdc++)
@@ -197,7 +197,8 @@ endif()
 add_library(teesim_keymint SHARED
     keymint/keymint_router.cpp keymint/keymint_hook.cpp keymint/keymint_entry.cpp
     keymint/crypto_compat.c
-    common/control.cpp common/json.cpp)
+    common/control.cpp common/json.cpp common/log_context.cpp common/km_names.cpp
+    common/redact.cpp)
 add_dependencies(teesim_keymint rust_ta)
 target_include_directories(teesim_keymint PRIVATE
     keymint common injector/include rust/teesim-km/include ${LSPLT_JNI}/include)
@@ -238,7 +239,8 @@ target_link_libraries(binder_stub PRIVATE utils_stub)
 
 add_library(teesim_keystore SHARED
     keystore/binder_interceptor.cpp keystore/keystore_router.cpp keystore/keystore_entry.cpp
-    common/control.cpp common/json.cpp)
+    common/control.cpp common/json.cpp common/log_context.cpp common/km_names.cpp
+    common/redact.cpp)
 add_dependencies(teesim_keystore rust_ta)
 target_include_directories(teesim_keystore PRIVATE
     keystore common ${AOSP}/include injector/include ${LSPLT_JNI}/include

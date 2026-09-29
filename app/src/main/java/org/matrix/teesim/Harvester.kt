@@ -16,11 +16,9 @@ import java.security.cert.X509Certificate
 import java.security.spec.ECGenParameterSpec
 import java.util.Base64
 import org.bouncycastle.asn1.ASN1Boolean
-import org.bouncycastle.asn1.ASN1Encodable
 import org.bouncycastle.asn1.ASN1EncodableVector
 import org.bouncycastle.asn1.ASN1Enumerated
 import org.bouncycastle.asn1.ASN1Integer
-import org.bouncycastle.asn1.ASN1Null
 import org.bouncycastle.asn1.ASN1OctetString
 import org.bouncycastle.asn1.ASN1Sequence
 import org.bouncycastle.asn1.ASN1Set
@@ -403,14 +401,14 @@ object Harvester {
         val merged = base.overrides.toMutableMap()
         for ((field, raw) in user) {
             if (!userEditable(field, base)) {
-                SystemLogger.info("override: ignoring non-editable field '$field'")
+                SystemLogger.info("Harvester: override ignoring non-editable field '$field'")
                 continue
             }
             val value = raw.trim()
             when {
                 value.isEmpty() -> Unit // reset: keep the computed default already in `merged`
                 !validOverride(field, value) ->
-                    SystemLogger.warning("override: ignoring invalid $field='$value'")
+                    SystemLogger.warning("Harvester: override ignoring invalid $field='$value'")
                 else -> merged[field] = Override(value, sourceFor(field), true, userEdited = true)
             }
         }
@@ -469,10 +467,10 @@ object Harvester {
 
         Vintf.attestationVersionConstraint("default")?.let { c ->
             val current = out.effectiveInt("attestationVersion", out.attestationVersion)
-            if (if (c.exact) current != c.version else current > c.version) {
+            if (c.violatedBy(current)) {
                 SystemLogger.info(
-                    "Harvest: constraining attestationVersion $current -> ${c.version} to the device's " +
-                        "VINTF-declared keystore HAL (${if (c.exact) "Keymaster HIDL, exact match" else "KeyMint AIDL, ceiling"})"
+                    "Harvester: constraining attestationVersion $current -> ${c.version} to the device's " +
+                        "VINTF-declared keystore HAL (${c.kind})"
                 )
                 out =
                     out.withOverride("attestationVersion", c.version.toString())
@@ -487,10 +485,10 @@ object Harvester {
                 ?: Vintf.attestationVersionConstraint("default"))
             ?.let { c ->
                 val current = out.strongBoxAttestationVersion
-                if (if (c.exact) current != c.version else current > c.version) {
+                if (c.violatedBy(current)) {
                     SystemLogger.info(
-                        "Harvest: constraining strongBoxAttestationVersion $current -> ${c.version} to the " +
-                            "device's VINTF-declared StrongBox keystore HAL"
+                        "Harvester: constraining strongBoxAttestationVersion $current -> ${c.version} to the " +
+                            "device's VINTF-declared StrongBox keystore HAL (${c.kind})"
                     )
                     out = out.copy(strongBoxAttestationVersion = c.version)
                 }
@@ -509,29 +507,34 @@ object Harvester {
 
         val effective =
             when {
-                // A prior good harvest exists: keep its frozen boot key/hash forever.
+                // A prior good harvest exists: keep its frozen boot KEY forever (it feeds KEK
+                // derivation, so changing it would strand every key blob wrapped under the old
+                // one). The HASH is attestation-only and has no such constraint — it legitimately
+                // changes across bootloader/OS updates, so each boot's own live capture wins
+                // whenever it's usable; only an unusable capture this boot falls back to the
+                // persisted value, so effectiveBootHash() still returns something stable instead of
+                // zero.
                 existing != null && !existing.harvestFailed -> {
                     if (fresh != null && !fresh.harvestFailed) {
-                        // Refresh volatile fields but freeze verifiedBoot* — unless a stale
-                        // all-zero value was frozen before the zero-reject fix, in which case adopt
-                        // the fresh (guaranteed non-zero) one.
                         fresh.copy(
                             verifiedBootKey =
                                 if (isUsableBootValue(existing.verifiedBootKey))
                                     existing.verifiedBootKey
                                 else fresh.verifiedBootKey,
                             verifiedBootHash =
-                                if (isUsableBootValue(existing.verifiedBootHash))
-                                    existing.verifiedBootHash
-                                else fresh.verifiedBootHash,
-                            // When we keep existing's real captured boot value, drop fresh's
-                            // synthesized override for it — the captured value is now honest and
-                            // needs no override.
+                                if (isUsableBootValue(fresh.verifiedBootHash))
+                                    fresh.verifiedBootHash
+                                else existing.verifiedBootHash,
+                            // When we keep existing's real captured boot value instead of fresh's,
+                            // drop fresh's synthesized override for it — the captured value is now
+                            // honest and needs no override. (A no-op when fresh's own raw was
+                            // usable: buildOverrides never sets one in that case.)
                             overrides =
                                 fresh.overrides.filterKeys { k ->
                                     !(k == "verifiedBootKey" &&
                                         isUsableBootValue(existing.verifiedBootKey)) &&
                                         !(k == "verifiedBootHash" &&
+                                            !isUsableBootValue(fresh.verifiedBootHash) &&
                                             isUsableBootValue(existing.verifiedBootHash))
                                 },
                         )
@@ -549,11 +552,18 @@ object Harvester {
         val enriched =
             clampAttestationToVintf(markFabricatedAttestation(supplementDeviceIds(stable)))
         persist(enriched)
+        // A genuinely attested boot key/hash and a synthesized stand-in look the same as 64 hex
+        // digits, so each is tagged with its source: raw when attested this boot, otherwise the
+        // OverrideSource harvested.json records.
+        fun bootTag(field: String): String =
+            stable.overrides[field]?.let { "(${it.source.name.lowercase()})" } ?: "(raw)"
         SystemLogger.info(
-            "Harvest complete: failed=${enriched.harvestFailed} " +
-                "bootKey=${stable.effectiveBootKey().toHex()} bootHash=${stable.effectiveBootHash().toHex()} " +
-                "locked=${effective.deviceLocked} vbState=${effective.verifiedBootState} " +
-                "attestSecLevel=${effective.attestationSecurityLevel} " +
+            "Harvester: harvest complete, failed=${enriched.harvestFailed} " +
+                "bootKey=${stable.effectiveBootKey().toHex()}${bootTag("verifiedBootKey")} " +
+                "bootHash=${stable.effectiveBootHash().toHex()}${bootTag("verifiedBootHash")} " +
+                "locked=${effective.deviceLocked} " +
+                "vbState=${KmNames.verifiedBootState(effective.verifiedBootState)} " +
+                "attestSecLevel=${KmNames.securityLevel(effective.attestationSecurityLevel)} " +
                 "os=${effective.osVersion} osPatch=${effective.osPatchLevel} " +
                 "vendorPatch=${enriched.vendorPatchLevel} bootPatch=${enriched.bootPatchLevel}"
         )
@@ -579,7 +589,7 @@ object Harvester {
                 if (overrides["verifiedBootKey"] != pinned) {
                     overrides = overrides + ("verifiedBootKey" to pinned)
                     SystemLogger.info(
-                        "Harvest: pinned verifiedBootKey to the persisted value (KEK stability)"
+                        "Harvester: pinned verifiedBootKey to the persisted value (KEK stability)"
                     )
                 }
             }
@@ -594,7 +604,7 @@ object Harvester {
                     if (fresh != persisted) {
                         overrides = overrides + ("verifiedBootHash" to persisted)
                         SystemLogger.info(
-                            "Harvest: reused the persisted verifiedBootHash (this harvest fell back to a random value)"
+                            "Harvester: reused the persisted verifiedBootHash (this harvest fell back to a random value)"
                         )
                     }
                 }
@@ -636,8 +646,14 @@ object Harvester {
                 safeId("getMeidForSubscriber(0)") { phoneSubInfoId("getMeidForSubscriber", 0) }
             }
         val serial = r.serial.ifBlank { DeviceProps.prop("ro.serialno", "") }
+        // Redacted at the source rather than on export, since a log is usually pasted rather than
+        // exported. The tokens still compare, so "does the profile attest the device's own IMEI"
+        // stays answerable from the log alone.
+        Redact.learn(listOf(imei, imei2, meid, serial).filter { it.isNotBlank() })
         SystemLogger.info(
-            "Harvest telephony IDs: imei='$imei' secondImei='$imei2' meid='$meid' serial='$serial'"
+            "Harvester: telephony ids imei=${Redact.quoted(imei)} " +
+                "secondImei=${Redact.quoted(imei2)} meid=${Redact.quoted(meid)} " +
+                "serial=${Redact.quoted(serial)}"
         )
         // These ids are not carried by device-properties attestation. When the attested leaf had no
         // value (r.<id> blank) and we read one from the OS, it is a SUPPLEMENT override — the RAW
@@ -666,7 +682,7 @@ object Harvester {
         }
         if (supplemented.isNotEmpty())
             SystemLogger.info(
-                "Harvest: device ids not attested; supplemented from system properties: " +
+                "Harvester: device ids not attested; supplemented from system properties: " +
                     supplemented.joinToString(" ")
             )
         return out
@@ -731,7 +747,7 @@ object Harvester {
                     null
                 }
             if (!imei.isNullOrBlank()) {
-                if (waits > 0) SystemLogger.info("Harvest telephony: ready after ${waits}s")
+                if (waits > 0) SystemLogger.info("Harvester: telephony ready after ${waits}s")
                 return
             }
             waits++
@@ -742,7 +758,7 @@ object Harvester {
             }
         }
         SystemLogger.warning(
-            "Harvest telephony: no IMEI after ${TELEPHONY_WAIT_MS / 1000}s; proceeding (no telephony or modem still down)"
+            "Harvester: telephony has no IMEI after ${TELEPHONY_WAIT_MS / 1000}s; proceeding (no telephony or modem still down)"
         )
     }
 
@@ -794,12 +810,12 @@ object Harvester {
     private inline fun safeId(what: String, block: () -> String?): String =
         try {
             val v = block()?.takeIf { it.isNotBlank() && !it.equals("null", true) } ?: ""
-            if (v.isBlank()) SystemLogger.info("Harvest telephony: $what returned empty")
+            if (v.isBlank()) SystemLogger.info("Harvester: telephony $what returned empty")
             v
         } catch (e: Exception) {
             val cause = (e as? InvocationTargetException)?.targetException ?: e
             SystemLogger.warning(
-                "Harvest telephony: $what failed: ${cause.javaClass.simpleName}: ${cause.message}"
+                "Harvester: telephony $what failed: ${cause.javaClass.simpleName}: ${cause.message}"
             )
             ""
         }
@@ -817,7 +833,7 @@ object Harvester {
                 strongBoxAttestationVersion = sb.attestationVersion ?: rec.attestationVersion,
             )
         } catch (e: Exception) {
-            SystemLogger.error("Failed to parse harvested attestation", e)
+            SystemLogger.error("Harvester: parsing the harvested attestation failed", e)
             null
         }
     }
@@ -835,10 +851,12 @@ object Harvester {
     private fun probeStrongBox(): StrongBoxProbe {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return StrongBoxProbe(false, null)
         val leaf = tryLeaf(withDeviceIds = false, strongBox = true)
-        val version = leaf?.let { runCatching { parse(it).attestationVersion }.getOrNull() }
+        val version = leaf?.let {
+            runCatching { parse(it, "StrongBox").attestationVersion }.getOrNull()
+        }
         val available = leaf != null
         SystemLogger.info(
-            "Harvest: StrongBox-backed key generation available = $available (attestationVersion=$version)"
+            "Harvester: StrongBox-backed key generation available = $available (attestationVersion=$version)"
         )
         return StrongBoxProbe(available, version)
     }
@@ -875,7 +893,7 @@ object Harvester {
             ks.deleteEntry(CHECK_ALIAS) // always clean up
             if (chain.isNullOrEmpty()) {
                 if (!withDeviceIds)
-                    SystemLogger.warning("Harvest: empty certificate chain (no working TEE?)")
+                    SystemLogger.warning("Harvester: empty certificate chain (no working TEE?)")
                 null
             } else {
                 chain[0] as X509Certificate
@@ -883,10 +901,13 @@ object Harvester {
         } catch (e: Exception) {
             if (withDeviceIds) {
                 SystemLogger.info(
-                    "Harvest: device-properties attestation failed; retrying plain (${e.message})"
+                    "Harvester: device-properties attestation failed; retrying plain (${e.message})"
                 )
             } else {
-                SystemLogger.warning("Harvest: attested key generation failed (no working TEE?)", e)
+                SystemLogger.warning(
+                    "Harvester: attested key generation failed (no working TEE?)",
+                    e,
+                )
             }
             try {
                 KeyStore.getInstance("AndroidKeyStore")
@@ -897,7 +918,10 @@ object Harvester {
         }
     }
 
-    private fun parse(leaf: X509Certificate): Record {
+    /**
+     * Parse a harvested attestation leaf; [level] only labels the log lines ("TEE"/"StrongBox").
+     */
+    private fun parse(leaf: X509Certificate, level: String = "TEE"): Record {
         val holder = X509CertificateHolder(leaf.encoded)
         val ext: Extension =
             holder.getExtension(org.bouncycastle.asn1.ASN1ObjectIdentifier(OID))
@@ -992,15 +1016,23 @@ object Harvester {
         val meid = idFrom(sw, tee, TAG_ATTESTATION_ID_MEID)
         val imei2 = idFrom(sw, tee, TAG_ATTESTATION_ID_SECOND_IMEI)
         SystemLogger.info(
-            "Harvest: device reports locked=$deviceLocked vbState=$verifiedBootState; attesting locked/Verified"
+            "Harvester: level=$level device reports locked=$deviceLocked " +
+                "vbState=${KmNames.verifiedBootState(verifiedBootState)}; attesting locked/Verified"
         )
         // The whole KeyDescription decoded onto one line — every field, and every key parameter in
-        // the softwareEnforced/teeEnforced authorization lists, as tag-and-value. This is the
-        // ground truth to check a captured id (e.g. the IMEI tag) against, independent of the
-        // per-field parsing above.
-        SystemLogger.info(
-            "Harvest leaf KeyDescription: " +
-                kd.joinToString(separator = ", ") { formatAsn1Primitive(it) }
+        // the softwareEnforced/hardwareEnforced authorization lists, as name=value with enums
+        // decoded. This is the ground truth to check a captured id (e.g. the IMEI tag) against,
+        // independent of the per-field parsing above.
+        //
+        // At DEBUG, and redacted: it is a long line carrying attestationApplicationId (a package
+        // name and its signing-certificate digest) and moduleHash, and it is the same line on
+        // every boot. AOSP strips the application id from
+        // anything keystore2 itself logs, for the same reason. Redacted here at the source, not
+        // only at bug-report export time (Report.kt), so a live logcat/log-file read never carries
+        // the unredacted package name either.
+        SystemLogger.debug(
+            "Harvester: leaf level=$level key_description=" +
+                Redact.text(KmNames.keyDescription(kd))
         )
         return Record(
             harvestFailed = false,
@@ -1058,22 +1090,50 @@ object Harvester {
      *    has no value yet. apexd writes the file once after activation completes, so it is never
      *    partially populated. Returns 32 zero bytes only if both are unavailable (Resolver then
      *    keeps the persisted value).
+     *
+     * Cached for the process lifetime once a real source answers: APEX activation is a boot-time,
+     * one-shot event (a module update only takes effect after the next reboot) and keystore2's own
+     * `ENCODED_MODULE_INFO` is itself set-once-per-boot (see maintenance.rs `set_module_info`), so
+     * neither source can legitimately change value between one resolve and the next this boot —
+     * only whether either has answered YET can change, while we're still early in boot. Resolver
+     * calls this on every commit, and the cache spares a binder round-trip and a repeated log line
+     * each time.
      */
+    @Volatile private var cachedModuleHash: ByteArray? = null
+
     fun resolveModuleHash(): ByteArray {
+        cachedModuleHash?.let {
+            return it
+        }
         Keystore2Service.getSupplementaryAttestationInfo(KM_TAG_MODULE_HASH)?.let { der ->
+            val hash = sha256(der)
+            val modules = decodeModuleInfoDer(der)
             SystemLogger.info(
-                "moduleHash: via keystore2 getSupplementaryAttestationInfo (${der.size} DER bytes)"
+                "Harvester: moduleHash ${hash.toHex()} via keystore2 getSupplementaryAttestationInfo, " +
+                    "${modules.size} modules"
             )
-            return sha256(der)
+            SystemLogger.debug(
+                "Harvester: moduleHash modules " +
+                    modules.joinToString(", ") { (name, version) -> "$name@$version" }
+            )
+            cachedModuleHash = hash
+            return hash
         }
         apexInfoListModules()?.let { modules ->
+            val hash = sha256(moduleInfoDer(modules))
             SystemLogger.info(
-                "moduleHash: keystore2 info unavailable; via /apex/apex-info-list.xml (${modules.size} modules)"
+                "Harvester: moduleHash ${hash.toHex()} via /apex/apex-info-list.xml " +
+                    "(keystore2 info unavailable), ${modules.size} modules"
             )
-            return sha256(moduleInfoDer(modules))
+            SystemLogger.debug(
+                "Harvester: moduleHash modules " +
+                    modules.joinToString(", ") { (name, version) -> "$name@$version" }
+            )
+            cachedModuleHash = hash
+            return hash
         }
         SystemLogger.warning(
-            "moduleHash: keystore2 and /apex/apex-info-list.xml both unavailable; no module hash"
+            "Harvester: moduleHash keystore2 and /apex/apex-info-list.xml both unavailable; no module hash"
         )
         return ByteArray(32)
     }
@@ -1110,7 +1170,7 @@ object Harvester {
         }
             .getOrElse {
                 SystemLogger.warning(
-                    "apexInfoListModules: failed to parse /apex/apex-info-list.xml",
+                    "Harvester.apexInfoListModules: failed to parse /apex/apex-info-list.xml",
                     it,
                 )
                 null
@@ -1143,6 +1203,30 @@ object Harvester {
             .forEach { payload.write(it.second) }
         return derSet(payload.toByteArray())
     }
+
+    /**
+     * Inverse of [moduleInfoDer]: decode keystore2's own MODULE_HASH DER blob back into (name,
+     * version) pairs, per AOSP's `ModuleInfo { name: OctetString, version: i32 }`
+     * (keystore2/src/maintenance.rs), so the harvest log shows the actual active-module list a
+     * captured moduleHash attests to — the blob is that list, not a hash itself; we SHA-256 it
+     * ourselves to get the tag-724 value.
+     */
+    private fun decodeModuleInfoDer(der: ByteArray): List<Pair<String, Long>> = runCatching {
+        ASN1Set.getInstance(der).map { member ->
+            val seq = ASN1Sequence.getInstance(member)
+            val name =
+                ASN1OctetString.getInstance(seq.getObjectAt(0)).octets.toString(Charsets.UTF_8)
+            val version = ASN1Integer.getInstance(seq.getObjectAt(1)).value.toLong()
+            name to version
+        }
+    }
+        .getOrElse {
+            SystemLogger.warning(
+                "Harvester.decodeModuleInfoDer: failed to parse keystore2's MODULE_HASH DER blob",
+                it,
+            )
+            emptyList()
+        }
 
     private fun sha256(bytes: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(bytes)
@@ -1179,41 +1263,6 @@ object Harvester {
         return out.toByteArray()
     }
 
-    /**
-     * Recursively formats any ASN.1 value into one concise, readable token: integers/enumerated as
-     * their number, an octet string as "text" when printable else #hex, a tagged object as
-     * [TAG n]<inner>, a sequence as [ … ], a set as { … }. Applied over a KeyDescription it renders
-     * the entire authorization list — every key parameter — on a single log line.
-     */
-    private fun formatAsn1Primitive(obj: ASN1Encodable?): String {
-        return when (val primitive = obj?.toASN1Primitive()) {
-            null -> "NULL"
-            is ASN1Integer -> primitive.value.toString()
-            is ASN1Enumerated -> primitive.value.toString()
-            is ASN1Boolean -> primitive.isTrue.toString()
-            is ASN1Null -> "NULL"
-            is ASN1OctetString -> {
-                val bytes = primitive.octets
-                when {
-                    bytes.isEmpty() -> "\"\""
-                    bytes.all { it >= 32 && it < 127 } -> "\"${String(bytes, Charsets.UTF_8)}\""
-                    else -> "#" + bytes.toHex()
-                }
-            }
-            is ASN1TaggedObject ->
-                "[TAG ${primitive.tagNo}]${formatAsn1Primitive(primitive.baseObject)}"
-            is ASN1Sequence ->
-                primitive
-                    .map { formatAsn1Primitive(it) }
-                    .joinToString(prefix = "[", postfix = "]", separator = ", ")
-            is ASN1Set ->
-                primitive
-                    .map { formatAsn1Primitive(it) }
-                    .joinToString(prefix = "{", postfix = "}", separator = ", ")
-            else -> primitive.toString()
-        }
-    }
-
     /** The UTF-8 value of an attestation-ID tag, searching both enforced lists, or "". */
     private fun idFrom(sw: ASN1Sequence, tee: ASN1Sequence, tag: Int): String {
         for (seq in listOf(sw, tee)) {
@@ -1248,12 +1297,12 @@ object Harvester {
         if (isUsableBootValue(raw)) return null
         VbMeta.computeDigest()?.let {
             SystemLogger.info(
-                "boot hash: TEE reported none; using the vbmeta digest computed from partitions"
+                "Harvester: boot hash TEE reported none; using the vbmeta digest computed from partitions"
             )
             return BootOverride(it.toHex(), editable = false)
         }
         SystemLogger.warning(
-            "boot hash: TEE reported none and the vbmeta digest could not be computed; using a random per-install fallback"
+            "Harvester: boot hash TEE reported none and the vbmeta digest could not be computed; using a random per-install fallback"
         )
         return BootOverride(fallbackBootHash().toHex(), editable = true)
     }
@@ -1293,7 +1342,9 @@ object Harvester {
     // --- fallback (no working TEE) ---------------------------------------------
 
     private fun fallback(): Record {
-        SystemLogger.warning("Harvest failed; synthesizing boot values + Build.VERSION props")
+        SystemLogger.warning(
+            "Harvester: harvest failed; synthesizing boot values + Build.VERSION props"
+        )
         val osVersion = DeviceProps.deviceOsVersion()
         val osPatchLevel = DeviceProps.toYyyymm(DeviceProps.systemSecurityPatch())
         val vendorPatchLevel = DeviceProps.toYyyymmdd(DeviceProps.vendorSecurityPatch())
@@ -1377,7 +1428,7 @@ object Harvester {
         return try {
             fromJson(JSONObject(f.readText()))
         } catch (e: Exception) {
-            SystemLogger.warning("Could not read harvested.json; ignoring", e)
+            SystemLogger.warning("Harvester: cannot read harvested.json; ignoring", e)
             null
         }
     }
@@ -1387,20 +1438,34 @@ object Harvester {
             Const.harvestedFile.parentFile?.mkdirs()
             Const.harvestedFile.writeText(toJson(r).toString(2))
         } catch (e: Exception) {
-            SystemLogger.error("Failed to write harvested.json", e)
+            SystemLogger.error("Harvester: writing harvested.json failed", e)
         }
     }
 
-    private val b64 = Base64.getEncoder()
     private val b64d = Base64.getDecoder()
+
+    /**
+     * Hex, or — for a file a v2-or-earlier build wrote — base64: whichever `s` actually is. Every
+     * field this reads is a fixed-size SHA-256-shaped digest, so a legacy base64 encoding always
+     * carries a trailing `=` pad character, which is never a hex digit; the two encodings are
+     * unambiguous to tell apart. Reading is self-describing rather than keyed off [version] on
+     * purpose: verifiedBootKey/verifiedBootHash are frozen precisely so they never change across an
+     * install, and a version-gated migration that silently re-derived them on a format bump would
+     * be exactly the kind of change this file exists to prevent.
+     */
+    private fun decodeBytes(s: String): ByteArray =
+        if (s.isNotEmpty() && s.all { it in "0123456789abcdefABCDEF" })
+            ByteArray(s.length / 2) {
+                ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte()
+            }
+        else b64d.decode(s)
 
     fun toJson(r: Record): JSONObject =
         JSONObject().apply {
-            put("version", 2)
+            put("version", 3)
             put("harvestFailed", r.harvestFailed)
-            put("frozen", !r.harvestFailed)
-            put("verifiedBootKey", b64.encodeToString(r.verifiedBootKey))
-            put("verifiedBootHash", b64.encodeToString(r.verifiedBootHash))
+            put("verifiedBootKey", r.verifiedBootKey.toHex())
+            put("verifiedBootHash", r.verifiedBootHash.toHex())
             put("deviceLocked", r.deviceLocked)
             put("verifiedBootState", r.verifiedBootState)
             put("attestationSecurityLevel", r.attestationSecurityLevel)
@@ -1413,7 +1478,7 @@ object Harvester {
             put("osPatchLevel", r.osPatchLevel ?: JSONObject.NULL)
             put("vendorPatchLevel", r.vendorPatchLevel ?: JSONObject.NULL)
             put("bootPatchLevel", r.bootPatchLevel ?: JSONObject.NULL)
-            put("moduleHash", r.moduleHash?.let { b64.encodeToString(it) } ?: JSONObject.NULL)
+            put("moduleHash", r.moduleHash?.let { it.toHex() } ?: JSONObject.NULL)
             put("brand", r.brand)
             put("device", r.device)
             put("product", r.product)
@@ -1446,8 +1511,8 @@ object Harvester {
         }
 
     private fun fromJson(o: JSONObject): Record {
-        val bootKey = b64d.decode(o.getString("verifiedBootKey"))
-        val bootHash = b64d.decode(o.getString("verifiedBootHash"))
+        val bootKey = decodeBytes(o.getString("verifiedBootKey"))
+        val bootHash = decodeBytes(o.getString("verifiedBootHash"))
         return Record(
             harvestFailed = o.optBoolean("harvestFailed", false),
             verifiedBootKey = bootKey,
@@ -1465,7 +1530,7 @@ object Harvester {
             osPatchLevel = o.optIntOrNull("osPatchLevel"),
             vendorPatchLevel = o.optIntOrNull("vendorPatchLevel"),
             bootPatchLevel = o.optIntOrNull("bootPatchLevel"),
-            moduleHash = o.optStringOrNull("moduleHash")?.let { b64d.decode(it) },
+            moduleHash = o.optStringOrNull("moduleHash")?.let { decodeBytes(it) },
             brand = o.optString("brand", ""),
             device = o.optString("device", ""),
             product = o.optString("product", ""),

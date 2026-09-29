@@ -29,7 +29,7 @@ class Injector(private val moduleDir: File) {
         running = true
         if (!injectBin.exists() || !libFile.exists()) {
             SystemLogger.error(
-                "injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
+                "Injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
                     "under ${moduleDir.absolutePath}/$abi"
             )
         }
@@ -41,7 +41,7 @@ class Injector(private val moduleDir: File) {
     }
 
     private fun loop() {
-        SystemLogger.info("injector: watching $procName (abi=$abi lib=$libName)")
+        SystemLogger.info("Injector: watching $procName (abi=$abi lib=$libName)")
         var failures = 0
         while (running) {
             val pid = findPid(procName)
@@ -52,11 +52,11 @@ class Injector(private val moduleDir: File) {
                 if (inject(pid)) {
                     lastPid = pid
                     failures = 0
-                    SystemLogger.info("injector: injected into $procName pid=$pid")
+                    SystemLogger.info("Injector: injected into $procName pid=$pid")
                     confirmAsync(pid)
                 } else {
                     failures++
-                    SystemLogger.warning("injector: injection into pid=$pid failed; will retry")
+                    SystemLogger.warning("Injector: injection into pid=$pid failed; will retry")
                 }
             } else if (pid <= 0) {
                 lastPid = -1 // process gone; force re-inject when it returns
@@ -93,7 +93,7 @@ class Injector(private val moduleDir: File) {
                         sleep(500)
                     }
                     SystemLogger.warning(
-                        "injector: injected pid=$pid but the lib never checked in over ${Const.CONTROL_SOCKET_PATH} " +
+                        "Injector: injected pid=$pid but the lib never checked in over ${Const.CONTROL_SOCKET_PATH} " +
                             "(SELinux on the control socket? look for 'avc: denied' in logcat)"
                     )
                 },
@@ -118,10 +118,10 @@ class Injector(private val moduleDir: File) {
                     .start()
             val output = proc.inputStream.bufferedReader().readText()
             val code = proc.waitFor()
-            if (code != 0) SystemLogger.warning("injector: inject exit=$code output=$output")
+            if (code != 0) SystemLogger.warning("Injector: inject exit=$code output=$output")
             code == 0
         } catch (e: Exception) {
-            SystemLogger.error("injector: failed to run inject binary", e)
+            SystemLogger.error("Injector: failed to run inject binary", e)
             false
         }
     }

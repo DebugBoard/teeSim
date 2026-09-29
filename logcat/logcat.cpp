@@ -97,6 +97,7 @@ public:
 private:
     void OpenCurrent();
     void Rotate();
+    void RotateIfNewBoot();
     void WriteLine(std::string_view line);
     void Emit(std::string_view line);  // status line straight to the file, never back through logd
     void Process(struct log_msg* buf);
@@ -106,6 +107,10 @@ private:
     int fd_ = -1;
     size_t written_ = 0;
     pid_t my_pid_ = getpid();
+    // The previous kept line's wall-clock second, for the clock-step detector in Process(). Persists
+    // across a logd reconnect (OnCrash) — only a genuine boot marker resets what counts as expected.
+    time_t last_sec_ = 0;
+    bool have_last_sec_ = false;
 };
 
 void Logcat::OpenCurrent() {
@@ -138,6 +143,85 @@ void Logcat::Rotate() {
     OpenCurrent();  // a fresh, empty teesim.log
 }
 
+// Give a reboot its own file boundary, without undoing the reason teesim.log always appends.
+//
+// Rotation is otherwise a byte-count decision (Rotate(), above); this adds a second trigger alongside
+// it, so a boot boundary is always a file boundary too.
+//
+// The trigger has to tell a genuine reboot apart from a service.sh respawn within the same boot,
+// because OpenCurrent's append-through-restart is deliberate: a crash loop's whole point is that its
+// restarts belong in one file, next to each other, not scattered one-per-file. The kernel's boot id
+// (/proc/sys/kernel/random/boot_id, a UUID regenerated once per kernel boot, world-readable, no
+// special permission needed) is exactly the distinction this needs and nothing else on the device
+// offers as cheaply: unlike a wall-clock timestamp it cannot be fooled by an unsynced RTC, and unlike
+// comparing against the last line already in the file it costs one small read, not a parse.
+//
+// The last-seen id lives in a marker file next to the logs. A rotate fires whenever the current id
+// does not match it, and a missing marker counts as a mismatch: a non-empty teesim.log with no
+// marker (first run of a marker-writing build, or a reinstall that wiped the data directory) holds
+// an earlier boot's lines and deserves the same boundary.
+//
+// What still holds a rotation back is written_ == 0: a brand-new, genuinely empty teesim.log has
+// nothing worth preserving, so a fresh install's very first line does not burn a pointless rotation
+// on a file with zero bytes in it. A boot_id read failure (sandboxed environment, odd kernel)
+// degrades to always appending, since there is no signal to act on either way.
+//
+// Rotate()'s own file count is untouched by any of this: it always drops teesim.4.log and shifts the
+// rest up by one, so the chain is teesim.log plus at most four rolled parts — five files, total, on
+// disk under log/ — no matter how often a boot fires it. A device that reboots often just spends that
+// fixed budget on more, shorter-lived boots rather than fewer, longer ones; it can never grow the
+// file count past five.
+void Logcat::RotateIfNewBoot() {
+    std::string boot_id;
+    {
+        int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;  // no signal either way; keep appending
+        char buf[64];
+        ssize_t n = read(fd, buf, sizeof(buf));
+        close(fd);
+        if (n <= 0) return;
+        boot_id.assign(buf, static_cast<size_t>(n));
+        while (!boot_id.empty() && (boot_id.back() == '\n' || boot_id.back() == '\r')) {
+            boot_id.pop_back();
+        }
+        if (boot_id.empty()) return;
+    }
+
+    const std::string marker_path = dir_ + "/.boot_id";
+    std::string last;
+    bool had_marker = false;
+    {
+        int fd = open(marker_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char buf[64];
+            ssize_t n = read(fd, buf, sizeof(buf));
+            close(fd);
+            if (n > 0) {
+                last.assign(buf, static_cast<size_t>(n));
+                had_marker = true;
+            }
+        }
+    }
+
+    const bool new_boot = !had_marker || last != boot_id;
+
+    int fd = open(marker_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        // Best effort. A persistent write failure here (full or read-only data partition) leaves
+        // the marker stuck at an older id, so every later respawn within this SAME boot reads it as
+        // a mismatch and rotates again — over-rotating rather than under-rotating. A partition in
+        // that state has already broken the config and keybox persistence this daemon depends on.
+        ssize_t unused = write(fd, boot_id.data(), boot_id.size());
+        (void)unused;
+        close(fd);
+    }
+
+    if (new_boot && written_ > 0) {
+        Emit("\n--- new boot detected; rotating the previous boot's log ---");
+        Rotate();
+    }
+}
+
 void Logcat::WriteLine(std::string_view line) {
     if (fd_ < 0) return;
     bool add_nl = line.empty() || line.back() != '\n';
@@ -166,12 +250,42 @@ void Logcat::Process(struct log_msg* buf) {
     while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.remove_suffix(1);
 
     int tpid = g_target_pid.load(std::memory_order_relaxed);
+    // Kept means kept in full: whatever reaches this point is written to the ring and the file at
+    // whatever level it arrived at. Level filtering happens once, at display time in the WebUI; a
+    // cutoff here would silently hide lines the WebUI's "show everything" setting asks for.
     bool keep = std::find(kKeepTags.begin(), kKeepTags.end(), tag) != kKeepTags.end() ||
                 entry.priority == ANDROID_LOG_FATAL || buf->id() == LOG_ID_CRASH ||
                 (tpid > 0 && entry.pid == tpid);
     if (!keep) return;
 
     char level = kLogChar[entry.priority <= ANDROID_LOG_SILENT ? entry.priority : ANDROID_LOG_INFO];
+
+    // A boot whose clock has not synced yet logs the platform's no-RTC default date, then jumps
+    // forward by years once NTP corrects it, inside the same boot. Two lines written a second apart
+    // would then read as years apart, so a large jump between adjacent lines is marked.
+    // RotateIfNewBoot cannot catch this: the boot id does not change mid-boot.
+    //
+    // A boot marker's own arrival is exempted, since the device really was off and that gap is
+    // expected; a clock step deep inside one boot's startup is not near a marker and gets flagged. The threshold is generous enough that no ordinary idle stretch on a real device
+    // trips it: something reaches this filtered stream far more often than every six hours on any
+    // phone actually being used, so a gap that large is itself worth a line even in the rare case it
+    // is not a clock step.
+    constexpr time_t kClockGapWarnSec = 6 * 3600;
+    const bool is_boot_marker = tag == "AndroidRuntime"sv && msg.find(">>>>>> START"sv) != msg.npos;
+    if (have_last_sec_ && !is_boot_marker) {
+        const long long delta =
+            static_cast<long long>(entry.tv_sec) - static_cast<long long>(last_sec_);
+        if (delta > kClockGapWarnSec || delta < -kClockGapWarnSec) {
+            char m[160];
+            snprintf(m, sizeof(m),
+                    "\n--- wall-clock gap of %lldh between adjacent lines, no reboot in between "
+                    "(device asleep, or the clock stepped) ---",
+                    delta / 3600);
+            Emit(m);
+        }
+    }
+    last_sec_ = entry.tv_sec;
+    have_last_sec_ = true;
 
     // threadtime layout: "MM-DD HH:MM:SS.mmm  PID  TID L TAG: message". Kept human-readable for the
     // file and the download; the WebUI reads level/tag from the packed fields, not by re-parsing this.
@@ -212,6 +326,7 @@ void Logcat::OnCrash(int err) {
 
 void Logcat::Run() {
     OpenCurrent();
+    RotateIfNewBoot();
     unsigned int tail = 0;  // first attach: no history, just follow
     while (true) {
         auto* list = android_logger_list_alloc(0 /* blocking */, tail, 0);
@@ -261,6 +376,7 @@ extern "C" JNIEXPORT void JNICALL Java_org_matrix_teesim_LogTail_nativeSetTarget
                                                                                     jint pid) {
     g_target_pid.store(pid, std::memory_order_relaxed);
 }
+
 
 // Current maximum sequence number, so the WebUI's cursor can advance even when a poll returns nothing.
 extern "C" JNIEXPORT jlong JNICALL Java_org_matrix_teesim_LogTail_nativeMaxSeq(JNIEnv*, jobject) {

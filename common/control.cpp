@@ -24,7 +24,10 @@
 #include <vector>
 
 #include "json.hpp"
+// The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
+#define LOG_SUB "ctl"
 #include "logging.hpp"
+#include "redact.h"
 
 namespace {
 
@@ -184,6 +187,11 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
   applied = 0;
   total = 0;
   if (const tjson::Value *e = msg.get("epoch")) epoch = static_cast<uint64_t>(e->as_int(0));
+  if (const tjson::Value *s = msg.get("redactSalt")) {
+    std::vector<uint8_t> salt;
+    Base64Decode(s->as_string(), salt);
+    RedactSetSalt(salt.data(), salt.size());
+  }
 
   // Device-wide boot info.
   std::vector<uint8_t> vb_key, vb_hash, module_hash;
@@ -200,12 +208,12 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
     boot.attest_version_tee =
         bi->get("attestVersionTee") ? int32_t(bi->get("attestVersionTee")->as_int(400)) : 400;
     boot.attest_version_strongbox = bi->get("attestVersionStrongBox")
-                                        ? int32_t(bi->get("attestVersionStrongBox")->as_int(400))
-                                        : boot.attest_version_tee;
+                                        ? int32_t(bi->get("attestVersionStrongBox")->as_int(300))
+                                        : 300;
   } else {
     boot.device_locked = true;
     boot.attest_version_tee = 400;
-    boot.attest_version_strongbox = 400;
+    boot.attest_version_strongbox = 300;
   }
   boot.verified_boot_key = vb_key.data();
   boot.verified_boot_key_len = vb_key.size();
@@ -225,7 +233,7 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
       s.mode = pj.get("mode") ? pj.get("mode")->as_string() : std::string();
       if (const tjson::Value *kb = pj.get("keyboxB64")) {
         if (!Base64Decode(kb->as_string(), s.keybox)) {
-          LOGE("control: profile %s has an undecodable keybox", s.id.c_str());
+          LOGE("ApplyConfig: profile %s has an undecodable keybox", s.id.c_str());
           continue;
         }
       }
@@ -281,7 +289,7 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
   }
   char err[128] = {0};
   int committed = teesim_cfg_commit(epoch, err, sizeof(err));
-  if (committed < 0) LOGE("control: commit failed: %s", err);
+  if (committed < 0) LOGE("ApplyConfig: commit failed: %s", err);
 }
 
 std::string BuildHello() {
@@ -312,7 +320,7 @@ void HandleConnection(int fd) {
   struct ucred cred{};
   socklen_t clen = sizeof(cred);
   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) != 0 || cred.uid != 0) {
-    LOGE("control: rejecting non-root peer uid=%d", cred.uid);
+    LOGE("HandleConnection: rejecting non-root peer uid=%d", cred.uid);
     close(fd);
     return;
   }
@@ -322,7 +330,7 @@ void HandleConnection(int fd) {
   while (ReadFrame(fd, frame)) {
     tjson::Value msg;
     if (!tjson::parse(frame.data(), frame.size(), msg)) {
-      LOGE("control: dropping unparseable frame (%zu bytes)", frame.size());
+      LOGE("HandleConnection: dropping unparseable frame (%zu bytes)", frame.size());
       continue;
     }
     const tjson::Value *type = msg.get("type");
@@ -332,7 +340,7 @@ void HandleConnection(int fd) {
       int applied = 0, total = 0;
       ApplyConfig(msg, epoch, applied, total);
       WriteFrame(fd, BuildAck(epoch, applied, total));
-      LOGI("control: applied config epoch=%llu profiles=%d/%d",
+      LOGI("HandleConnection: applied config epoch=%llu profiles=%d/%d",
            static_cast<unsigned long long>(epoch), applied, total);
     } else if (t == "resign") {
       // Re-sign one existing key's attestation leaf under its profile's keybox. The daemon sends the
@@ -341,6 +349,12 @@ void HandleConnection(int fd) {
       const tjson::Value *pid = msg.get("profile");
       const tjson::Value *lb = msg.get("leafB64");
       std::string profile = pid ? pid->as_string() : std::string();
+      // This runs on the control thread, not an app's binder thread, and reaches the same
+      // patch_attestation the KeyMint path does, so it stamps a context of its own to keep a WebUI
+      // re-sign distinguishable from an app's generateKey in the TA's lines.
+      char rid[16];
+      snprintf(rid, sizeof(rid), "r%04x", teesim_log_new_rid());
+      LogContext lc_(std::string("[webui-resign ") + rid + "] ");
       std::vector<uint8_t> leaf;
       // Accumulate the chain as a JSON array body via the cert sink (captureless -> C callback).
       struct SinkCtx {
@@ -389,7 +403,7 @@ void HandleConnection(int fd) {
 void *ServerThread(void *) {
   int srv = socket(AF_UNIX, SOCK_STREAM, 0);
   if (srv < 0) {
-    LOGE("control: socket() failed: %s", strerror(errno));
+    LOGE("ServerThread: socket() failed: %s", strerror(errno));
     return nullptr;
   }
   struct sockaddr_un addr{};
@@ -409,24 +423,24 @@ void *ServerThread(void *) {
       break;
     }
     if (attempt == 9) {
-      LOGE("control: bind(%s) failed: %s", kSocketPath, strerror(errno));
+      LOGE("ServerThread: bind(%s) failed: %s", kSocketPath, strerror(errno));
       close(srv);
       return nullptr;
     }
     sleep(1);
   }
   if (listen(srv, 4) != 0) {
-    LOGE("control: listen() failed: %s", strerror(errno));
+    LOGE("ServerThread: listen() failed: %s", strerror(errno));
     close(srv);
     return nullptr;
   }
-  LOGI("control: listening on %s (hook=%s)", kSocketPath, teesim_hook_name());
+  LOGI("ServerThread: listening on %s (hook=%s)", kSocketPath, teesim_hook_name());
 
   for (;;) {
     int fd = accept(srv, nullptr, nullptr);
     if (fd < 0) {
       if (errno == EINTR) continue;
-      LOGE("control: accept() failed: %s", strerror(errno));
+      LOGE("ServerThread: accept() failed: %s", strerror(errno));
       break;
     }
     HandleConnection(fd);  // one connection at a time; the daemon is the sole client
@@ -447,7 +461,7 @@ extern "C" void teesim_control_start(void) {
   if (pthread_create(&t, nullptr, ServerThread, nullptr) == 0) {
     pthread_detach(t);
   } else {
-    LOGE("control: pthread_create failed");
+    LOGE("ServerThread: pthread_create failed");
     started = false;
   }
 }

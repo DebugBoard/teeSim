@@ -75,7 +75,7 @@ object Keystore2Service {
         } catch (e: Throwable) {
             val cause = (e as? InvocationTargetException)?.targetException ?: e
             SystemLogger.warning(
-                "Keystore2Service.deleteKeyById($keyId) failed: ${cause.javaClass.simpleName}: ${cause.message}"
+                "Keystore2Service.deleteKeyById: keyId=$keyId failed: ${cause.javaClass.simpleName}: ${cause.message}"
             )
             false
         }
@@ -115,12 +115,15 @@ object Keystore2Service {
             p.waitFor()
             val code = p.exitValue()
             SystemLogger.info(
-                "spawnOwnerOp('$op', keyId=$keyId, uid=$uid): child exit $code" +
+                "Keystore2Service.spawnOwnerOp: op=$op keyId=$keyId uid=$uid child exit $code" +
                     if (out.isEmpty()) "" else " | ${out.takeLast(180)}"
             )
             code
         } catch (e: Throwable) {
-            SystemLogger.warning("spawnOwnerOp('$op', keyId=$keyId, uid=$uid) spawn failed", e)
+            SystemLogger.warning(
+                "Keystore2Service.spawnOwnerOp: op=$op keyId=$keyId uid=$uid spawn failed",
+                e,
+            )
             -1
         }
     }
@@ -156,7 +159,7 @@ object Keystore2Service {
         } catch (e: Throwable) {
             val cause = (e as? InvocationTargetException)?.targetException ?: e
             SystemLogger.warning(
-                "Keystore2Service.getSupplementaryAttestationInfo($tag) failed: ${cause.javaClass.simpleName}: ${cause.message}"
+                "Keystore2Service.getSupplementaryAttestationInfo: tag=$tag failed: ${cause.javaClass.simpleName}: ${cause.message}"
             )
             null
         }
@@ -189,7 +192,7 @@ object Keystore2Service {
         } catch (e: Throwable) {
             val cause = (e as? InvocationTargetException)?.targetException ?: e
             SystemLogger.warning(
-                "Keystore2Service.updateSubcomponent($keyId) failed: ${cause.javaClass.simpleName}: ${cause.message}"
+                "Keystore2Service.updateSubcomponent: keyId=$keyId failed: ${cause.javaClass.simpleName}: ${cause.message}"
             )
             false
         }
@@ -218,7 +221,7 @@ object Keystore2Service {
             )
         } catch (e: Throwable) {
             SystemLogger.warning(
-                "updateSubcomponentAsUid(keyId=$keyId, uid=$uid) failed: ${e.javaClass.simpleName}: ${e.message}"
+                "Keystore2Service.updateSubcomponentAsUid: keyId=$keyId uid=$uid failed: ${e.javaClass.simpleName}: ${e.message}"
             )
             -1
         } finally {

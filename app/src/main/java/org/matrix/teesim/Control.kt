@@ -88,6 +88,14 @@ object Control {
 
     private fun supervise() {
         var backoff = 500L
+        // Consecutive failed connection attempts without an intervening success. Same idiom as
+        // KeyAdmin's accept loop (#265): a peer that never comes back is retried forever at the
+        // 10s-capped backoff, so only the first failure of a burst is logged, and the reconnect
+        // line reports how many attempts failed.
+        var consecutiveFailures = 0
+        // Until the first connection the socket is expected to be missing: the daemon starts
+        // connecting before the injector has loaded the interceptor that listens on it.
+        var everConnected = false
         while (running) {
             var socket: LocalSocket? = null
             try {
@@ -106,16 +114,25 @@ object Control {
                     }
                 if (peerUid != Const.AID_KEYSTORE) {
                     SystemLogger.error(
-                        "control: peer uid $peerUid != keystore ${Const.AID_KEYSTORE}; refusing to send"
+                        "Control: peer uid $peerUid != keystore ${Const.AID_KEYSTORE}; refusing to send"
                     )
                     socket.close()
                     sleep(backoff)
                     backoff = (backoff * 2).coerceAtMost(10_000)
                     continue
                 }
-                SystemLogger.info(
-                    "control: connected to ${Const.CONTROL_SOCKET_PATH} (peer uid=$peerUid)"
-                )
+                if (consecutiveFailures > 0) {
+                    SystemLogger.info(
+                        "Control: connected to ${Const.CONTROL_SOCKET_PATH} (peer uid=$peerUid) " +
+                            "after $consecutiveFailures failed attempt(s)"
+                    )
+                } else {
+                    SystemLogger.info(
+                        "Control: connected to ${Const.CONTROL_SOCKET_PATH} (peer uid=$peerUid)"
+                    )
+                }
+                consecutiveFailures = 0
+                everConnected = true
                 backoff = 500L
 
                 val out = socket.outputStream
@@ -141,7 +158,16 @@ object Control {
                     writer.interrupt()
                 }
             } catch (e: Exception) {
-                SystemLogger.warning("control: connection error: ${e.message}")
+                consecutiveFailures++
+                if (consecutiveFailures == 1) {
+                    if (everConnected) {
+                        SystemLogger.warning("Control: connection error: ${e.message}")
+                    } else {
+                        SystemLogger.debug(
+                            "Control: interceptor not listening yet (${e.message}); retrying"
+                        )
+                    }
+                }
             } finally {
                 try {
                     socket?.close()
@@ -177,7 +203,7 @@ object Control {
                 when {
                     toSend != null -> {
                         writeFrame(conn.out, toSend!!)
-                        SystemLogger.info("control: pushed config (epoch=$seq)")
+                        SystemLogger.info("Control: pushed config (epoch=$seq)")
                     }
                     doPing -> writeFrame(conn.out, "{\"type\":\"ping\",\"epoch\":$seq}")
                 }
@@ -195,7 +221,7 @@ object Control {
             try {
                 JSONObject(frame)
             } catch (e: Exception) {
-                SystemLogger.warning("control: unparseable frame from lib")
+                SystemLogger.warning("Control: unparseable frame from lib")
                 return
             }
         when (msg.optString("type")) {
@@ -203,12 +229,12 @@ object Control {
                 libHook = if (msg.has("hook")) msg.optString("hook") else null
                 libApi = msg.optInt("androidApi", 0)
                 SystemLogger.info(
-                    "control: lib hello hook=$libHook api=$libApi pid=${msg.optInt("keystorePid", 0)}"
+                    "Control: lib hello hook=$libHook api=$libApi pid=${msg.optInt("keystorePid", 0)}"
                 )
             }
             "ack" -> {
                 SystemLogger.info(
-                    "control: ack epoch=${msg.optLong("epoch")} ok=${msg.optBoolean("ok")} " +
+                    "Control: ack epoch=${msg.optLong("epoch")} ok=${msg.optBoolean("ok")} " +
                         "applied=${msg.optInt("profilesApplied")} failed=${msg.optInt("profilesFailed")}"
                 )
                 // The ack means the lib has committed the new profile set — the point at which
@@ -221,7 +247,7 @@ object Control {
                         try {
                             cb()
                         } catch (e: Throwable) {
-                            SystemLogger.warning("control: re-attest run failed: ${e.message}")
+                            SystemLogger.warning("Control: re-attest run failed: ${e.message}")
                         }
                     }
                 }
@@ -237,8 +263,28 @@ object Control {
                 usageReplies.clear()
                 usageReplies.offer(msg)
             }
-            "pong" -> SystemLogger.verbose("control: pong ${msg.optLong("epoch")}")
+            "pong" -> logPong(msg.optLong("epoch"))
         }
+    }
+
+    // The keepalive answers every 30s for as long as the channel is up. A pong that reports a new
+    // epoch is logged; an unchanged one only every [PONG_LOG_EVERY]th, to show the channel is
+    // alive.
+    private const val PONG_LOG_EVERY = 20 // ~10 minutes
+    private var lastPongEpoch = Long.MIN_VALUE
+    private var pongsSinceLog = 0
+
+    private fun logPong(epoch: Long) {
+        pongsSinceLog++
+        if (epoch != lastPongEpoch) {
+            SystemLogger.verbose("Control: pong $epoch")
+        } else if (pongsSinceLog >= PONG_LOG_EVERY) {
+            SystemLogger.verbose("Control: pong $epoch ($pongsSinceLog since the last logged)")
+        } else {
+            return
+        }
+        lastPongEpoch = epoch
+        pongsSinceLog = 0
     }
 
     /**
@@ -252,7 +298,7 @@ object Control {
             activeOut
                 ?: run {
                     SystemLogger.warning(
-                        "control: resign for '$profileId' skipped — no live connection"
+                        "Control: resign for '$profileId' skipped — no live connection"
                     )
                     return null
                 }
@@ -262,21 +308,21 @@ object Control {
                 .put("type", "resign")
                 .put("profile", profileId)
                 .put("leafB64", Base64.getEncoder().encodeToString(leaf))
-        SystemLogger.info("control: resign request (profile=$profileId, leaf=${leaf.size} bytes)")
+        SystemLogger.info("Control: resign request (profile=$profileId, leaf=${leaf.size} bytes)")
         try {
             writeFrame(out, req.toString())
         } catch (e: Exception) {
-            SystemLogger.warning("control: resign send failed: ${e.message}")
+            SystemLogger.warning("Control: resign send failed: ${e.message}")
             return null
         }
         val reply =
             resignReplies.poll(RESIGN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                 ?: run {
-                    SystemLogger.warning("control: resign timed out (profile $profileId)")
+                    SystemLogger.warning("Control: resign timed out (profile $profileId)")
                     return null
                 }
         if (!reply.optBoolean("ok")) {
-            SystemLogger.warning("control: resign rejected by lib (profile $profileId)")
+            SystemLogger.warning("Control: resign rejected by lib (profile $profileId)")
             return null
         }
         val arr = reply.optJSONArray("chainB64") ?: return null
@@ -284,11 +330,11 @@ object Control {
         return try {
             val chain = (0 until arr.length()).map { dec.decode(arr.getString(it)) }
             SystemLogger.info(
-                "control: resign returned a ${chain.size}-cert chain for '$profileId'"
+                "Control: resign returned a ${chain.size}-cert chain for '$profileId'"
             )
             chain
         } catch (e: Exception) {
-            SystemLogger.warning("control: resign reply undecodable: ${e.message}")
+            SystemLogger.warning("Control: resign reply undecodable: ${e.message}")
             null
         }
     }
@@ -309,20 +355,20 @@ object Control {
             val out =
                 activeOut
                     ?: run {
-                        SystemLogger.verbose("control: getUsage skipped — no live connection")
+                        SystemLogger.verbose("Control: getUsage skipped — no live connection")
                         return null
                     }
             usageReplies.clear()
             try {
                 writeFrame(out, "{\"type\":\"getUsage\"}")
             } catch (e: Exception) {
-                SystemLogger.warning("control: getUsage send failed: ${e.message}")
+                SystemLogger.warning("Control: getUsage send failed: ${e.message}")
                 return null
             }
             val reply =
                 usageReplies.poll(USAGE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                     ?: run {
-                        SystemLogger.warning("control: getUsage timed out")
+                        SystemLogger.warning("Control: getUsage timed out")
                         return null
                     }
             reply.optJSONArray("apps")

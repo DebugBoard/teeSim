@@ -58,7 +58,7 @@ object Packages {
             } catch (e: PackageManager.NameNotFoundException) {
                 -1
             } catch (e: Exception) {
-                SystemLogger.warning("uidForPackage($pkg) failed", e)
+                SystemLogger.warning("Packages.uidForPackage: $pkg failed", e)
                 -1
             }
         else applicationInfoAsUser(pkg, userId)?.uid ?: -1
@@ -96,7 +96,12 @@ object Packages {
             SystemLogger.info(
                 "Packages: ${users.size} user(s) on device — " +
                     users.joinToString(", ") {
-                        "${it.id} '${it.name}'${if (it.managed) " (work)" else ""}"
+                        // User 0's name is commonly the device owner's real name (Android seeds it
+                        // from the Google account at setup); a secondary/work profile's is a
+                        // generic label ("Work profile", "Private space") the user picked, not a
+                        // person's name, so only user 0's is worth redacting here.
+                        val name = if (it.id == 0) Redact.token(it.name) else it.name
+                        "${it.id} '$name'${if (it.managed) " (work)" else ""}"
                     }
             )
         } else {
@@ -288,7 +293,9 @@ object Packages {
         for (user in users()) {
             val infos = installedApplications(user.id)
             if (infos.isEmpty()) {
-                SystemLogger.warning("installedAppsByUid: user ${user.id} enumerated no app")
+                SystemLogger.warning(
+                    "Packages.installedAppsByUid: user ${user.id} enumerated no app"
+                )
                 continue
             }
             total += infos.size
@@ -329,7 +336,7 @@ object Packages {
                     )
                 } catch (e: Exception) {
                     SystemLogger.warning(
-                        "installedAppsByUid: skipping uid $uid (user ${user.id})",
+                        "Packages.installedAppsByUid: skipping uid $uid (user ${user.id})",
                         e,
                     )
                 }
@@ -365,7 +372,7 @@ object Packages {
         val out = HashSet<String>()
         for (names in installedPackageNamesByUser().values) out.addAll(names)
         if (out.isEmpty())
-            SystemLogger.warning("allInstalledPackageNames: enumeration came back empty")
+            SystemLogger.warning("Packages.allInstalledPackageNames: enumeration came back empty")
         return out
     }
 
@@ -383,7 +390,7 @@ object Packages {
                 @Suppress("DEPRECATION") pm.getInstalledApplications(0)
             } catch (e: Exception) {
                 SystemLogger.warning(
-                    "installedApplications(user 0): getInstalledApplications failed",
+                    "Packages.installedApplications: user 0 getInstalledApplications failed",
                     e,
                 )
                 emptyList()
@@ -502,7 +509,7 @@ object Packages {
             if (png != null) iconCache.put(pkg, png)
             png
         } catch (e: Exception) {
-            SystemLogger.warning("iconPng($pkg): render failed", e)
+            SystemLogger.warning("Packages.iconPng: $pkg render failed", e)
             null
         }
     }
@@ -540,14 +547,14 @@ object Packages {
             }
         } catch (e: Exception) {
             SystemLogger.warning(
-                "iconPng($pkg): resource icon load failed, trying getApplicationIcon",
+                "Packages.iconPng: $pkg resource icon load failed, trying getApplicationIcon",
                 e,
             )
         }
         return try {
             pm.getApplicationIcon(pkg)
         } catch (e: Exception) {
-            SystemLogger.warning("iconPng($pkg, user $userId): getApplicationIcon failed", e)
+            SystemLogger.warning("Packages.iconPng: $pkg user $userId getApplicationIcon failed", e)
             null
         }
     }
@@ -584,7 +591,7 @@ object Packages {
                 ServiceManager.waitForService("package")
             else ServiceManager.getService("package")
         if (binder == null) {
-            SystemLogger.error("package service not available")
+            SystemLogger.error("Packages: package service not available")
             return null
         }
         return IPackageManager.Stub.asInterface(binder).also { ipm = it }
@@ -594,7 +601,7 @@ object Packages {
         try {
             packageManagerService()?.getPackagesForUid(uid) ?: emptyArray()
         } catch (e: Exception) {
-            SystemLogger.warning("getPackagesForUid($uid) failed", e)
+            SystemLogger.warning("Packages.packagesForUid: getPackagesForUid($uid) failed", e)
             emptyArray()
         }
 }

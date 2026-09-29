@@ -125,7 +125,7 @@ object KeystoreDb {
             logSchemaOnce(db)
             query(db, targets)
         } catch (e: Throwable) {
-            SystemLogger.warning("KeystoreDb.listKeys failed", e)
+            SystemLogger.warning("KeystoreDb.listKeys: failed", e)
             emptyList()
         } finally {
             try {
@@ -220,7 +220,7 @@ object KeystoreDb {
             )
             out
         } catch (e: Throwable) {
-            SystemLogger.warning("KeystoreDb.attestedKeys failed", e)
+            SystemLogger.warning("KeystoreDb.attestedKeys: failed", e)
             emptyList()
         } finally {
             try {
@@ -339,7 +339,7 @@ object KeystoreDb {
                 .use { c -> while (c.moveToNext()) out.add(c.getLong(0) to c.getInt(1)) }
             out
         } catch (e: Throwable) {
-            SystemLogger.warning("KeystoreDb.targetAttestKeyIds failed", e)
+            SystemLogger.warning("KeystoreDb.targetAttestKeyIds: failed", e)
             emptyList()
         } finally {
             try {
@@ -394,7 +394,7 @@ object KeystoreDb {
                 .use { c -> while (c.moveToNext()) out.add(c.getLong(0) to c.getInt(1)) }
             out
         } catch (e: Throwable) {
-            SystemLogger.warning("KeystoreDb.filterTargetIds failed", e)
+            SystemLogger.warning("KeystoreDb.filterTargetIds: failed", e)
             emptyList()
         } finally {
             try {
@@ -460,7 +460,7 @@ object KeystoreDb {
             )
         } catch (e: Throwable) {
             SystemLogger.warning(
-                "KeystoreDb.deleteFromDatabase failed (SELinux may deny writing keystore2's DB)",
+                "KeystoreDb.deleteFromDatabase: failed (SELinux may deny writing keystore2's DB)",
                 e,
             )
         } finally {
@@ -555,7 +555,7 @@ object KeystoreDb {
             )
         } catch (e: Throwable) {
             SystemLogger.warning(
-                "KeystoreDb.updateSubcomponents failed (SELinux may deny writing keystore2's DB)",
+                "KeystoreDb.updateSubcomponents: failed (SELinux may deny writing keystore2's DB)",
                 e,
             )
         } finally {
@@ -599,8 +599,8 @@ object KeystoreDb {
             db.rawQuery("SELECT sql FROM sqlite_master WHERE name='keyentry'", null).use { c ->
                 if (c.moveToNext()) keyentrySql = c.getString(0) ?: ""
             }
-            SystemLogger.info("KeystoreDb schema: tables=$tables")
-            SystemLogger.info("KeystoreDb keyentry: ${keyentrySql.replace('\n', ' ').trim()}")
+            SystemLogger.info("KeystoreDb: schema tables=$tables")
+            SystemLogger.info("KeystoreDb: keyentry ${keyentrySql.replace('\n', ' ').trim()}")
         } catch (e: Exception) {
             SystemLogger.warning("KeystoreDb: schema probe failed", e)
         }

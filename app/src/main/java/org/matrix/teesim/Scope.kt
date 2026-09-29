@@ -130,6 +130,38 @@ object Scope {
     }
 
     /**
+     * The per-profile resolution log, held back until the resolve finishes. A push re-resolves
+     * every profile, and most pushes (a keybox edit, a re-attest) leave scope exactly as it was: a
+     * resolve whose lines match the last one logged for that profile collapses to one "unchanged"
+     * line.
+     */
+    private class ResolveLog {
+        private val lines = ArrayList<Pair<Boolean, String>>() // (isWarning, message)
+
+        fun info(message: String) {
+            lines.add(false to message)
+        }
+
+        fun warning(message: String) {
+            lines.add(true to message)
+        }
+
+        fun flush(profileId: String, summary: String) {
+            val signature = lines.joinToString("\n") { it.second }
+            if (lastLogged.put(profileId, signature) == signature) {
+                SystemLogger.info("Scope[$profileId]: unchanged ($summary)")
+                return
+            }
+            for ((warn, message) in lines) {
+                if (warn) SystemLogger.warning(message) else SystemLogger.info(message)
+            }
+        }
+    }
+
+    /** The last resolution log emitted per profile id, for [ResolveLog.flush]. */
+    private val lastLogged = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
      * Resolve one profile against the live device. [others] are the config's OTHER profiles; their
      * explicit package/uid claims are excluded from this profile's auto-include expansion so a
      * user-app deliberately assigned elsewhere is never silently re-captured here.
@@ -147,6 +179,7 @@ object Scope {
     ): ProfileScope {
         val id = profile.id
         val explicit = profile.apps.map { parse(it) }
+        val log = ResolveLog()
 
         val packageNames = ArrayList<String>()
         val packageUsers = ArrayList<Int>()
@@ -170,9 +203,7 @@ object Scope {
                     // position — packages[] and uids[] have long since stopped lining up 1:1.
                     x.pkg?.let { uidPackages[x.uid] = it }
                     if (!quiet) {
-                        SystemLogger.info(
-                            "Scope[$id]: '${x.entry}' -> uid ${x.uid} (user ${x.userId})"
-                        )
+                        log.info("Scope[$id]: '${x.entry}' -> uid ${x.uid} (user ${x.userId})")
                         // An entry names one user's copy of the app. Say when the same app also
                         // runs in another user, because that copy is a different caller and stays
                         // untargeted until it is named — a silence that would otherwise read as a
@@ -182,26 +213,26 @@ object Scope {
                                 Packages.uidForPackage(x.pkg, it.id) >= 0
                             }
                             if (also.isNotEmpty())
-                                SystemLogger.info(
+                                log.info(
                                     "Scope[$id]: '${x.entry}' is also installed for " +
                                         also.joinToString(", ") { "user ${it.id} ('${it.name}')" } +
-                                        " — add '${x.pkg}@<user>' to target that copy too"
+                                        ", not in this profile's scope"
                                 )
                         }
                     }
                 }
                 Kind.RAW_UID -> {
                     uids.add(x.uid)
-                    if (!quiet) SystemLogger.info("Scope[$id]: raw uid:${x.uid} (user ${x.userId})")
+                    if (!quiet) log.info("Scope[$id]: raw uid:${x.uid} (user ${x.userId})")
                 }
                 Kind.INVALID -> {
                     if (quiet) Unit
                     else if (x.pkg != null)
-                        SystemLogger.info(
+                        log.info(
                             "Scope[$id]: '${x.entry}' -> NOT INSTALLED for user ${x.userId} (dropped)"
                         )
                     else
-                        SystemLogger.warning(
+                        log.warning(
                             "Scope[$id]: '${x.entry}' is not a valid package name, pkg@user or uid:N token (dropped)"
                         )
                 }
@@ -227,7 +258,7 @@ object Scope {
             // resolve).
             if (baseline.isEmpty()) {
                 if (!quiet)
-                    SystemLogger.warning(
+                    log.warning(
                         "Scope[$id]: auto-include skipped — no package baseline yet (nothing auto-added)"
                     )
             } else {
@@ -245,7 +276,7 @@ object Scope {
                 }
                 uids.addAll(autoUids)
                 if (!quiet)
-                    SystemLogger.info(
+                    log.info(
                         "Scope[$id]: auto-include added ${autoUids.size} post-baseline user uid(s)"
                     )
             }
@@ -253,7 +284,7 @@ object Scope {
 
         val lowUids = uids.filter { isPrivilegedUid(it) }.toSet()
         if (!quiet)
-            for (u in lowUids) SystemLogger.warning(
+            for (u in lowUids) log.warning(
                 "Scope[$id]: WARNING targeting privileged uid $u (app id ${u % Packages.PER_USER_RANGE} " +
                     "< first app uid $FIRST_APP_UID) — this is a system/shell uid (e.g. shell, " +
                     "system_server), not a normal app"
@@ -261,9 +292,15 @@ object Scope {
 
         val invalidCount = explicit.count { it.kind == Kind.INVALID }
         if (!quiet)
-            SystemLogger.info(
+            log.info(
                 "Scope[$id]: effective = ${packageNames.size} package-match name(s), ${uids.size} caller uid(s) " +
                     "${uids.sorted()}, $invalidCount invalid/uninstalled, ${autoUids.size} auto"
+            )
+
+        if (!quiet)
+            log.flush(
+                id,
+                "${packageNames.size} package(s), ${uids.size} uid(s), ${autoUids.size} auto",
             )
 
         return ProfileScope(
@@ -294,6 +331,7 @@ object Scope {
     )
 
     @Volatile private var resolved: Resolved? = null
+    private val lastSnapshotLine = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** The last published snapshot, or null before the first push has resolved anything. */
     fun lastResolved(): Resolved? = resolved
@@ -318,10 +356,13 @@ object Scope {
             "Scope: published resolved snapshot epoch=$epoch, ${scopes.size} profile(s), " +
                 "$autoTotal auto uid(s) total, baselineReady=$ready"
         )
-        for (s in scopes) SystemLogger.info(
-            "Scope: snapshot[${s.profileId}] ${s.packageNames.size} package(s), ${s.uids.size} uid(s), " +
-                "${s.autoUids.size} auto, autoInclude=${s.autoInclude}"
-        )
+        // Each profile's line only when it differs from the last snapshot's.
+        for (s in scopes) {
+            val line =
+                "Scope: snapshot[${s.profileId}] ${s.packageNames.size} package(s), " +
+                    "${s.uids.size} uid(s), ${s.autoUids.size} auto, autoInclude=${s.autoInclude}"
+            if (lastSnapshotLine.put(s.profileId, line) != line) SystemLogger.info(line)
+        }
     }
 
     /**

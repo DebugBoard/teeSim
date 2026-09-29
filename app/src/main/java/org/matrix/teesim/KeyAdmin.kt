@@ -18,6 +18,7 @@ import java.security.cert.X509Certificate
 import java.security.interfaces.ECPublicKey
 import java.security.interfaces.RSAPublicKey
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 import org.bouncycastle.asn1.ASN1Boolean
 import org.bouncycastle.asn1.ASN1Enumerated
 import org.bouncycastle.asn1.ASN1Integer
@@ -143,6 +144,61 @@ object KeyAdmin {
         val b = ByteArray(24)
         SecureRandom().nextBytes(b)
         return b.joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * True for the routes the WebUI polls on a timer while a panel is open: /logs and /status every
+     * few seconds, /packages every 9s while the Scope tab is visible. Their successful requests log
+     * at DEBUG so the daemon's own polling cannot bury what it is meant to show.
+     */
+    private fun isPoll(path: String): Boolean {
+        val route = path.substringBefore('?')
+        return route == "/logs" || route == "/status" || route == "/packages"
+    }
+
+    /**
+     * Successful poll-route completions: logged individually only for the first of a run, mirroring
+     * App.pollUsageOnce()'s "log on change, otherwise a periodic summary" idiom. The log file keeps
+     * every level, so a Logs panel polling every ~1.5s would otherwise dominate it; instead the
+     * count and average cost reach the file once every [HEARTBEAT_EVERY] requests.
+     */
+    private object PollLog {
+        private const val HEARTBEAT_EVERY = 40
+
+        private class Streak {
+            var announced = false
+            var count = 0
+            var totalMs = 0L
+        }
+
+        private val streaks = ConcurrentHashMap<String, Streak>()
+
+        /**
+         * Returns the line to log, or null to log nothing for this request. Keyed by route, not by
+         * the full path: a /logs poll carries a cursor that changes on every request.
+         */
+        fun tick(path: String, elapsedMs: Long): String? {
+            val route = path.substringBefore('?')
+            val streak = streaks.getOrPut(route) { Streak() }
+            synchronized(streak) {
+                if (!streak.announced) {
+                    streak.announced = true
+                    return "KeyAdmin: $route: polling (200 in ${elapsedMs}ms)"
+                }
+                streak.count++
+                streak.totalMs += elapsedMs
+                return when {
+                    streak.count % HEARTBEAT_EVERY == 0 -> {
+                        val avg = streak.totalMs / HEARTBEAT_EVERY
+                        val line = "KeyAdmin: $route: $HEARTBEAT_EVERY more poll(s), avg ${avg}ms"
+                        streak.count = 0
+                        streak.totalMs = 0
+                        line
+                    }
+                    else -> null
+                }
+            }
+        }
     }
 
     /**
@@ -303,7 +359,12 @@ object KeyAdmin {
             // silently — no response body, no reflected path, nothing to observe. There is no
             // browser on this transport any more, so no CORS/OPTIONS handling is needed.
             if (!tokensMatch(headerToken)) return
-            SystemLogger.info("KeyAdmin: → ${requestLine.take(140)}")
+            // Poll routes get no request line: the response side (see PollLog) already carries
+            // route, outcome and timing, and collapses a run of them. Every other route logs at
+            // INFO on both sides.
+            if (!isPoll(rawPath)) {
+                SystemLogger.info("KeyAdmin: → ${requestLine.take(140)}")
+            }
 
             // Raw (non-JSON) routes: a PNG icon and a plain-text log stream. The WebUI reaches
             // these through the same token-authenticated helper as every other route (a browser
@@ -312,6 +373,13 @@ object KeyAdmin {
             val rawRoute = rawPath.substringBefore('?')
             if (method == "GET" && rawRoute == "/logs/download") {
                 downloadLogs(out, parseQuery(rawPath.substringAfter('?', "")))
+                return
+            }
+            // The bug-report bundle, reached by the Save button. The daemon assembles and writes
+            // the
+            // file itself, so no log content passes through the WebView.
+            if (method == "POST" && rawRoute == "/report") {
+                writeReport(out, parseQuery(rawPath.substringAfter('?', "")))
                 return
             }
             if (method == "GET" && rawRoute == "/icon") {
@@ -386,9 +454,16 @@ object KeyAdmin {
                     }
                 val ok = body.optBoolean("ok", true)
                 respond(out, if (ok) 200 else 400, body)
-                SystemLogger.info(
-                    "KeyAdmin: ← ${method} ${path} ${if (ok) 200 else 400} in ${System.currentTimeMillis() - t0}ms"
-                )
+                val elapsed = System.currentTimeMillis() - t0
+                // A failed poll is still worth seeing in full; only a run of successes collapses
+                // (see PollLog).
+                if (ok && isPoll(path)) {
+                    PollLog.tick(path, elapsed)?.let { SystemLogger.debug(it) }
+                } else {
+                    SystemLogger.info(
+                        "KeyAdmin: ← ${method} ${path} ${if (ok) 200 else 400} in ${elapsed}ms"
+                    )
+                }
             } catch (e: Exception) {
                 respond(out, 500, JSONObject().put("ok", false).put("error", e.message ?: "error"))
                 SystemLogger.warning(
@@ -745,6 +820,65 @@ object KeyAdmin {
             listOf("Content-Disposition: attachment; filename=\"$name\""),
             payload,
         )
+    }
+
+    /**
+     * Write a redacted bug-report zip into the caller's chosen directory, and reply with its path.
+     *
+     * Redaction is on unless `redact=0` is asked for explicitly, because the failure mode of the
+     * default matters: a user attaching a bundle to a public issue should not have to have known to
+     * turn it on.
+     */
+    private fun writeReport(out: OutputStream, query: Map<String, String>) {
+        val dir = query["dir"]
+        if (dir == null || !dir.startsWith("/")) {
+            respond(out, 400, JSONObject().put("ok", false).put("error", "absolute dir required"))
+            return
+        }
+        val safeName = safeReportName(query["name"])
+        val dirFile = File(dir)
+        val canonicalDir = dirFile.canonicalPath
+        val target = File(dirFile, safeName)
+        val canonicalTarget = target.canonicalPath
+        // The same canonical-path recheck the log write uses: a name that escapes the directory it
+        // was resolved against is refused, whatever it looks like before resolution.
+        if (
+            canonicalTarget != canonicalDir + File.separator + safeName &&
+                !canonicalTarget.startsWith(canonicalDir + File.separator)
+        ) {
+            respond(out, 400, JSONObject().put("ok", false).put("error", "invalid path"))
+            return
+        }
+        try {
+            dirFile.mkdirs()
+            File(canonicalTarget).outputStream().buffered().use {
+                Report.writeBundle(
+                    it,
+                    redact = query["redact"] != "0",
+                    mapPackages = query["mapPackages"] == "1",
+                )
+            }
+            val size = File(canonicalTarget).length()
+            SystemLogger.info("KeyAdmin: wrote a ${size}-byte report to $canonicalTarget")
+            respond(
+                out,
+                200,
+                JSONObject().put("ok", true).put("path", canonicalTarget).put("bytes", size),
+            )
+        } catch (e: Exception) {
+            SystemLogger.warning("KeyAdmin: /report failed for $canonicalTarget", e)
+            respond(
+                out,
+                500,
+                JSONObject().put("ok", false).put("error", e.message ?: "write failed"),
+            )
+        }
+    }
+
+    /** [safeDownloadName] for a bundle, whose extension should say what it is. */
+    private fun safeReportName(raw: String?): String {
+        val cleaned = safeDownloadName(raw)
+        return if (cleaned.endsWith(".zip")) cleaned else "$cleaned.zip"
     }
 
     /**

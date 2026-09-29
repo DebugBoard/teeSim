@@ -60,19 +60,36 @@ object Vintf {
     private val cache = HashMap<String, Int?>()
 
     /**
-     * A VINTF-derived bound on the attestation version we may present for a security level: an
-     * EXACT target (legacy HIDL Keymaster, whose HAL version maps 1:1 to an attestation version) or
-     * a CEILING we must not exceed (AIDL KeyMint @N -> N*100).
+     * Which of the two ways a declared HAL bounds the attestation version we may present: an
+     * [EXACT] target (legacy HIDL Keymaster, whose HAL version maps 1:1 to an attestation version)
+     * or a [CEILING] we must not exceed (AIDL KeyMint @N -> N*100). Named so the log says which.
      */
-    data class AttestationConstraint(val version: Int, val exact: Boolean)
+    enum class ConstraintKind {
+        EXACT,
+        CEILING,
+    }
+
+    /** A VINTF-derived bound on the attestation version we may present for a security level. */
+    data class AttestationConstraint(val version: Int, val kind: ConstraintKind) {
+        /**
+         * True when `current` breaks this constraint: unequal for [ConstraintKind.EXACT], above for
+         * [ConstraintKind.CEILING]. Kept on the type itself so a third kind, if one is ever added,
+         * only needs this one definition updated rather than every call site's own `when`.
+         */
+        fun violatedBy(current: Int): Boolean =
+            when (kind) {
+                ConstraintKind.EXACT -> current != version
+                ConstraintKind.CEILING -> current > version
+            }
+    }
 
     private val constraintCache = HashMap<String, AttestationConstraint?>()
 
     /**
      * The attestation-version constraint the device's declared keystore HAL imposes for [instance]:
-     * an AIDL KeyMint HAL @N gives a ceiling of N*100 (exact=false); a legacy HIDL Keymaster HAL
-     * gives an exact target (@3.0 -> 2, @4.0 -> 3, @4.1 -> 4; AOSP system/keymaster). Prefers
-     * KeyMint when both are declared. Null when neither is declared.
+     * an AIDL KeyMint HAL @N gives a [ConstraintKind.CEILING] of N*100; a legacy HIDL Keymaster HAL
+     * gives an [ConstraintKind.EXACT] target (@3.0 -> 2, @4.0 -> 3, @4.1 -> 4; AOSP
+     * system/keymaster). Prefers KeyMint when both are declared. Null when neither is declared.
      * [Harvester.clampAttestationToVintf] reconciles the presented version against it. The
      * ceiling-vs-exact treatment follows ../Duck-Detector-Refactoring VintfKeyMintVersionProbe
      * (KeyMint compared as an upper bound, HIDL Keymaster as equality).
@@ -81,14 +98,16 @@ object Vintf {
     fun attestationVersionConstraint(instance: String = "default"): AttestationConstraint? {
         if (constraintCache.containsKey(instance)) return constraintCache[instance]
         val c =
-            keyMintHalVersion(instance)?.let { AttestationConstraint(it * 100, exact = false) }
+            keyMintHalVersion(instance)?.let {
+                AttestationConstraint(it * 100, ConstraintKind.CEILING)
+            }
                 ?: keymasterHalAttestationVersion(instance)?.let {
-                    AttestationConstraint(it, exact = true)
+                    AttestationConstraint(it, ConstraintKind.EXACT)
                 }
         constraintCache[instance] = c
         SystemLogger.info(
             "Vintf: attestation-version constraint for '$instance' = " +
-                "${c?.version ?: "unknown"} (exact=${c?.exact ?: false})"
+                "${c?.version ?: "unknown"} (${c?.kind ?: "unknown"})"
         )
         return c
     }
