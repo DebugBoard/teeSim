@@ -554,6 +554,22 @@ bool IsOurs(const std::vector<uint8_t>& blob) {
   return teesim_km_is_marked(blob.data(), blob.size());
 }
 
+// True when the request creates an asymmetric key (RSA or EC) — the only algorithms KeyMint
+// attests, and the only kind worth simulating. A symmetric key (AES/3DES/HMAC) is never attested,
+// so simulating one would move the app's key off the real hardware for no gain, and an auth-bound
+// one would then verify against a TA holding no device HMAC key. Those are forwarded to the real
+// HAL, exactly as the keystore1 path does (#291). A request with no algorithm tag cannot be one of
+// ours, so it forwards too.
+bool IsAsymmetricKeyRequest(const std::vector<KeyParameter>& params) {
+  for (const auto& p : params) {
+    if (p.tag == Tag::ALGORITHM && p.value.getTag() == KeyParameterValue::algorithm) {
+      const Algorithm a = p.value.get<KeyParameterValue::algorithm>();
+      return a == Algorithm::RSA || a == Algorithm::EC;
+    }
+  }
+  return false;
+}
+
 // True if the request creates a key with ATTEST_KEY purpose (an attestation key). Such a key MUST be
 // minted in the TA (generation), never patched: only if we hold its private key can our TA later sign
 // — and root-of-trust-patch — the leaves this key attests. A patched real-hardware attest key can only
@@ -980,6 +996,20 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return NoRealHal(__func__);
     }
+    // A target's symmetric key is forwarded, not simulated (see IsAsymmetricKeyRequest). An attest
+    // key is always asymmetric, so this never diverts one.
+    if (!IsAsymmetricKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("generateKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
+             "real TEE)");
+        ForwardGuard g;
+        auto st = real_->generateKey(keyParams, attestationKey, out);
+        if (!st.isOk())
+          LOGW("generateKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
+        return st;
+      }
+      return NoRealHal(__func__);
+    }
     // Creating an ATTESTATION KEY (ATTEST_KEY purpose) always mints it in the TA (ours). Unless the
     // caller named one of our keys as its attest key (the "ours" case just below), we ignore any
     // injected attest key and self-attest the new key under the keybox. This MUST come before the
@@ -1069,6 +1099,19 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
         ForwardGuard g;
         auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
         if (!st.isOk()) LOGW("importKey: FAILED in the real HAL: %s", StatusDesc(st).c_str());
+        return st;
+      }
+      return NoRealHal(__func__);
+    }
+    // As in generateKey, a symmetric key is forwarded rather than simulated.
+    if (!IsAsymmetricKeyRequest(keyParams)) {
+      if (real_) {
+        LOGI("importKey: symmetric key; forwarding to the real HAL (never attested, kept in the "
+             "real TEE)");
+        ForwardGuard g;
+        auto st = real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
+        if (!st.isOk())
+          LOGW("importKey: FAILED in the real HAL (symmetric): %s", StatusDesc(st).c_str());
         return st;
       }
       return NoRealHal(__func__);

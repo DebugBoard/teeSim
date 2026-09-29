@@ -108,6 +108,9 @@ enum {
   TAG_CERTIFICATE_NOT_AFTER = 0x600003f1,        // 0x60000000 | 1009
   ALGORITHM_RSA = 1,
   ALGORITHM_EC = 3,
+  ALGORITHM_AES = 32,
+  ALGORITHM_TRIPLE_DES = 33,
+  ALGORITHM_HMAC = 128,
   KEY_FORMAT_PKCS8 = 1,
   KS_NO_ERROR = 1,
   KS_SYSTEM_ERROR = 4,
@@ -324,6 +327,18 @@ int64_t ParamInt(const std::vector<KmParam>& params, uint32_t tag, int64_t dflt)
   return dflt;
 }
 
+// The algorithm a log line names, so a forwarded key says what it was rather than a bare number.
+const char* AlgorithmName(int64_t algorithm) {
+  switch (algorithm) {
+    case ALGORITHM_RSA: return "RSA";
+    case ALGORITHM_EC: return "EC";
+    case ALGORITHM_AES: return "AES";
+    case ALGORITHM_TRIPLE_DES: return "3DES";
+    case ALGORITHM_HMAC: return "HMAC";
+    default: return "unknown-algorithm";
+  }
+}
+
 // writeTypedObject(obj != null): a leading 1 then the object's body.
 void BeginTypedObject(Parcel& p) { p.writeInt32(1); }
 
@@ -400,6 +415,13 @@ bool MarshalEcPkcs8(const EC_KEY* ec, std::vector<uint8_t>& out) {
 // PKCS#8 private key and SubjectPublicKeyInfo public key.
 bool GenerateKeyPair(const std::vector<KmParam>& params, PendingKey& out) {
   int64_t algorithm = ParamInt(params, TAG_ALGORITHM, ALGORITHM_EC);
+  // Only RSA and EC have a key pair to generate; a symmetric algorithm would fall into the RSA
+  // branch below and ask BoringSSL for an RSA key of TAG_KEY_SIZE bits (256 for AES-256, refused).
+  if (algorithm != ALGORITHM_EC && algorithm != ALGORITHM_RSA) {
+    LOGE("GenerateKeyPair: FAILED, %s is not asymmetric; the key should never have been simulated",
+         AlgorithmName(algorithm));
+    return false;
+  }
   bssl::UniquePtr<EVP_PKEY> pkey(EVP_PKEY_new());
   if (algorithm == ALGORITHM_EC) {
     int64_t curve = ParamInt(params, TAG_EC_CURVE, 1 /*P-256*/);
@@ -591,6 +613,17 @@ bool HandleGenerateKey(int uid, Parcel& in, Parcel* reply) {
   if (in.readInt32() == 1) params = ReadKeymasterArguments(in, blobs);
   LOGI("generateKey: alias=%s params=%s", String8(alias).c_str(),
        KmDescribeParams(params.data(), params.size()).c_str());
+
+  // Only asymmetric keys are worth simulating: they carry the attestation, and they are the only
+  // kind this path can produce. A symmetric key (AES/3DES/HMAC) is never attested and lives entirely
+  // in the real keymaster; claiming one here would report success while recording no key the real
+  // keystore can see, so the app's first Cipher.init fails with KEY_NOT_FOUND (#291).
+  const int64_t algorithm = ParamInt(params, TAG_ALGORITHM, 0);
+  if (algorithm != ALGORITHM_RSA && algorithm != ALGORITHM_EC) {
+    LOGI("generateKey: alias=%s is a %s key, not asymmetric; forwarding to the real keystore",
+         String8(alias).c_str(), AlgorithmName(algorithm));
+    return false;
+  }
 
   PendingKey key;
   key.params = std::move(params);
