@@ -46,8 +46,20 @@ class Injector(private val moduleDir: File) {
         while (running) {
             // The full /proc walk in findPid touches every process's cmdline (~1000 reads on a
             // busy device); skip it while the pid we last injected is still alive, since it never
-            // changes between keystore restarts. Fall back to the walk only once it's gone.
-            val pid = if (lastPid > 0 && isNamedProcess(lastPid, procName)) lastPid else findPid(procName)
+            // changes between keystore restarts. Fall back to the walk only once it's gone. The
+            // fallback fires at most once per keystore restart (or per retry while injection keeps
+            // failing), so log it; the common alive-pid path stays silent to keep the loop cheap.
+            val pid =
+                if (lastPid > 0 && isNamedProcess(lastPid, procName)) {
+                    lastPid
+                } else {
+                    if (lastPid > 0) {
+                        SystemLogger.debug(
+                            "Injector: pid=$lastPid is no longer $procName; re-scanning /proc"
+                        )
+                    }
+                    findPid(procName)
+                }
             // Tell the log tail which process to capture, so the Logs panel shows the target
             // keystore's own output — even before we manage to inject it.
             LogTail.targetPid = if (pid > 0) pid else -1
