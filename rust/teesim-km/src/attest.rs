@@ -104,6 +104,12 @@ fn parse_algo(node: roxmltree::Node, algo: SigningAlgorithm) -> Result<AlgoInfo,
         .text()
         .ok_or_else(|| format!("{name}: empty PrivateKey"))?;
     let key_der = decode_pem(priv_pem)?;
+    // kmr-crypto-boring parses EC keys as bare SEC1 ECPrivateKey; keyboxes also ship PKCS#8
+    // ("BEGIN PRIVATE KEY") EC keys, which BoringSSL rejects with DECODE_ERROR.
+    let key_der = match algo {
+        SigningAlgorithm::Ec => unwrap_pkcs8_ec(key_der),
+        SigningAlgorithm::Rsa => key_der,
+    };
 
     let mut chain = Vec::new();
     for cert in node.descendants().filter(|n| n.has_tag_name("Certificate")) {
@@ -122,6 +128,39 @@ fn parse_algo(node: roxmltree::Node, algo: SigningAlgorithm) -> Result<AlgoInfo,
         }
     };
     Ok(AlgoInfo { key, chain })
+}
+
+/// Read one DER TLV at the start of `d`: (tag, content, rest). Definite lengths only.
+fn der_tlv(d: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, d) = d.split_first()?;
+    let (&l0, d) = d.split_first()?;
+    let (len, d) = if l0 < 0x80 {
+        (l0 as usize, d)
+    } else {
+        let n = (l0 & 0x7f) as usize;
+        if n == 0 || n > 4 || d.len() < n {
+            return None;
+        }
+        (d[..n].iter().fold(0usize, |a, &b| (a << 8) | b as usize), &d[n..])
+    };
+    if d.len() < len {
+        return None;
+    }
+    Some((tag, &d[..len], &d[len..]))
+}
+
+/// If `der` is a PKCS#8 PrivateKeyInfo, return the SEC1 ECPrivateKey it wraps; otherwise (already
+/// SEC1, or unrecognised) return it unchanged. PKCS#8 is SEQUENCE { INTEGER, SEQUENCE, OCTET STRING }
+/// while SEC1 is SEQUENCE { INTEGER, OCTET STRING, ... }, so the second element tells them apart.
+fn unwrap_pkcs8_ec(der: Vec<u8>) -> Vec<u8> {
+    let inner = (|| {
+        let (0x30, body, _) = der_tlv(&der)? else { return None };
+        let (0x02, _, rest) = der_tlv(body)? else { return None };
+        let (0x30, _, rest) = der_tlv(rest)? else { return None };
+        let (0x04, key, _) = der_tlv(rest)? else { return None };
+        Some(key.to_vec())
+    })();
+    inner.unwrap_or(der)
 }
 
 /// Strip PEM armor and all whitespace, then base64-decode.
