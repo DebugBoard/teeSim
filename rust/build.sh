@@ -24,6 +24,9 @@ case "$ABI" in
 esac
 ENVPREFIX="$(echo "$TRIPLE" | tr '[:lower:]-' '[:upper:]_')"
 
+# Honour a pinned ANDROID_NDK_HOME (CI pins the NDK this way) before guessing: runner images preinstall
+# newer NDKs, and picking the newest one breaks openssl-sys's bindgen run.
+if [ -z "${NDK_HOME:-}" ] && [ -d "${ANDROID_NDK_HOME:-}" ]; then NDK_HOME="$ANDROID_NDK_HOME"; fi
 if [ -z "${NDK_HOME:-}" ]; then
   NDK_HOME="$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)"
 fi
